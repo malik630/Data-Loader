@@ -1,0 +1,5468 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+attention_store.py
+baselines.py
+benchmark_A2.py
+evaluate.py
+extract_attention_a3.py
+loss.py
+model.py
+README.md
+READMEV2.md
+reconstruction_metrics.py
+requirements.txt
+sprint3_output/a2_benchmark_results.csv
+sprint3_output/a2_benchmark_results.json
+sprint3_output/best_model.pt
+sprint3_output/figure1.png
+sprint3_output/table_I_baselines.csv
+sprint3_output/table_I_metrics.csv
+sprint3_output/table_II_reconstruction.csv
+sprint3_output/team3/db_pipeline_benchmark.py
+sprint3_output/team3/output/db_pipeline_benchmark_results.csv
+sprint3_output/team3/output/db_pipeline_benchmark_results.json
+sprint3_output/team3/output/robustness_results.csv
+sprint3_output/team3/output/robustness_results.json
+sprint3_output/team3/Readme team3.md
+sprint3_output/team3/robustness_test.py
+sprint3_output/team3/schema_postgres.sql
+sprint3_output/team3/schema_timescaledb.sql
+thermal_npy_dataset.py
+thermal_tsdb_dataset.py
+train_example.py
+train.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="reconstruction_metrics.py">
+
+</file>
+
+<file path="attention_store.py">
+"""
+attention_store.py
+
+Sprint 3 – Task A3 : Store attention weights in TimescaleDB
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+What this file does
+-------------------
+1. Creates the attention_maps table in TimescaleDB (once, on first import)
+2. Provides insert_attention_map() to save weights after each inference
+
+This is imported and called inside train_example.py after each forward pass.
+
+Required by:
+  A4 — query top-k attention windows
+  B4 — Attention Alignment Accuracy
+  B5 — heatmap generation
+
+Usage
+-----
+  # In train_example.py, after model inference:
+  from attention_store import AttentionStore
+
+  store = AttentionStore(dsn)          # creates table if not exists
+  store.insert(
+      window_id  = 42,
+      patient_id = 3,
+      timestamps = [datetime1, datetime2, ...],   # 60 timestamps
+      weights    = [0.01, 0.03, ...],             # 60 attention weights
+      epoch      = 5,
+  )
+"""
+
+import os
+import logging
+from datetime import datetime
+from typing import List, Union
+
+import numpy as np
+import psycopg2
+from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger("attention_store")
+
+
+# ---------------------------------------------------------------------------
+# SQL — table + indexes (created once)
+# ---------------------------------------------------------------------------
+
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS attention_maps (
+    id          BIGSERIAL    PRIMARY KEY,
+    window_id   INTEGER      NOT NULL,
+    patient_id  SMALLINT     NOT NULL,
+    timestamp   TIMESTAMPTZ  NOT NULL,
+    weight      REAL         NOT NULL,
+    epoch       INTEGER,
+    inferred_at TIMESTAMPTZ  DEFAULT NOW()
+);
+"""
+
+_CREATE_INDEXES = [
+    # A4: find top-k weights per window
+    """
+    CREATE INDEX IF NOT EXISTS idx_attn_window_weight
+    ON attention_maps (window_id, patient_id, weight DESC);
+    """,
+    # B4/B5: retrieve all weights for a specific window
+    """
+    CREATE INDEX IF NOT EXISTS idx_attn_window_ts
+    ON attention_maps (window_id, patient_id, timestamp ASC);
+    """,
+]
+
+
+# ---------------------------------------------------------------------------
+# AttentionStore
+# ---------------------------------------------------------------------------
+
+class AttentionStore:
+    """
+    Manages the attention_maps table in TimescaleDB.
+
+    Parameters
+    ----------
+    dsn : str
+        PostgreSQL/TimescaleDB connection string.
+        If None, reads from environment variables.
+
+    Example
+    -------
+    store = AttentionStore(dsn)
+
+    # After model inference on a batch:
+    store.insert(
+        window_id  = int(meta["window_id"]),
+        patient_id = int(meta["patient_id"]),
+        timestamps = list(meta["timestamps"]),   # list of datetime, len=60
+        weights    = attn_weights.tolist(),      # list of float, len=60
+        epoch      = current_epoch,
+    )
+    """
+
+    def __init__(self, dsn: str = None):
+        self.dsn = dsn or _build_dsn()
+        self._ensure_table()
+
+    # ------------------------------------------------------------------
+    # Table creation (runs once)
+    # ------------------------------------------------------------------
+
+    def _ensure_table(self):
+        """Creates attention_maps table and indexes if they don't exist."""
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_CREATE_TABLE)
+                for idx_sql in _CREATE_INDEXES:
+                    cur.execute(idx_sql)
+            conn.commit()
+            log.info("attention_maps table ready (created or already exists)")
+        except Exception as e:
+            conn.rollback()
+            log.error(f"Failed to create attention_maps table: {e}")
+            raise
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Insert — single window
+    # ------------------------------------------------------------------
+
+    def insert(
+        self,
+        window_id:  int,
+        patient_id: int,
+        timestamps: List[datetime],
+        weights:    Union[List[float], np.ndarray],
+        epoch:      int = None,
+    ):
+        """
+        Inserts attention weights for one window into TimescaleDB.
+
+        Parameters
+        ----------
+        window_id  : int
+            The window_id from windows_tsdb table.
+        patient_id : int
+            The patient this window belongs to.
+        timestamps : list of datetime
+            One datetime per timestep in the window (length = window_size = 60).
+        weights : list or np.ndarray
+            Attention weight per timestep (same length as timestamps).
+            These are the mean attention weights across all heads and layers.
+        epoch : int, optional
+            Training epoch when this inference was made.
+        """
+        if len(timestamps) != len(weights):
+            raise ValueError(
+                f"timestamps ({len(timestamps)}) and weights ({len(weights)}) "
+                "must have the same length."
+            )
+
+        weights = np.array(weights, dtype=np.float32)
+
+        rows = [
+            (window_id, patient_id, ts, float(w), epoch)
+            for ts, w in zip(timestamps, weights)
+        ]
+
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO attention_maps
+                        (window_id, patient_id, timestamp, weight, epoch)
+                    VALUES %s
+                    """,
+                    rows,
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"Failed to insert attention map for window {window_id}: {e}")
+            raise
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Insert — full batch (more efficient)
+    # ------------------------------------------------------------------
+
+    def insert_batch(
+        self,
+        window_ids:  List[int],
+        patient_ids: List[int],
+        timestamps_batch: List[List[datetime]],
+        weights_batch:    Union[List[List[float]], np.ndarray],
+        epoch:       int = None,
+    ):
+        """
+        Inserts attention weights for a full batch of windows in one DB call.
+
+        Parameters
+        ----------
+        window_ids       : list of int, length = batch_size
+        patient_ids      : list of int, length = batch_size
+        timestamps_batch : list of lists — timestamps_batch[i] = 60 timestamps for window i
+        weights_batch    : (batch_size, window_size) array of attention weights
+        epoch            : training epoch
+        """
+        rows = []
+        for i, (wid, pid) in enumerate(zip(window_ids, patient_ids)):
+            for ts, w in zip(timestamps_batch[i], weights_batch[i]):
+                rows.append((wid, pid, ts, float(w), epoch))
+
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO attention_maps
+                        (window_id, patient_id, timestamp, weight, epoch)
+                    VALUES %s
+                    """,
+                    rows,
+                )
+            conn.commit()
+            log.debug(f"Inserted {len(rows)} attention rows for {len(window_ids)} windows")
+        except Exception as e:
+            conn.rollback()
+            log.warning(f"Batch insert failed: {e}")
+            raise
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Query helpers (used by A4)
+    # ------------------------------------------------------------------
+
+    def top_k_timestamps(self, window_id: int, patient_id: int, k: int = 5):
+        """
+        Returns the top-k timestamps with highest attention weights for a window.
+        Used by A4 to validate which timesteps the model focused on.
+
+        Returns list of (timestamp, weight) tuples, sorted by weight DESC.
+        """
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT timestamp, weight
+                    FROM attention_maps
+                    WHERE window_id = %s AND patient_id = %s
+                    ORDER BY weight DESC
+                    LIMIT %s;
+                    """,
+                    (window_id, patient_id, k),
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def get_window_weights(self, window_id: int, patient_id: int):
+        """
+        Returns all (timestamp, weight) for a window ordered by time.
+        Used by B5 for heatmap generation.
+        """
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT timestamp, weight
+                    FROM attention_maps
+                    WHERE window_id = %s AND patient_id = %s
+                    ORDER BY timestamp ASC;
+                    """,
+                    (window_id, patient_id),
+                )
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def count(self):
+        """Returns total number of rows in attention_maps."""
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM attention_maps;")
+                return cur.fetchone()[0]
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _build_dsn() -> str:
+    host     = os.getenv("TSDB_HOST",     "localhost")
+    port     = os.getenv("TSDB_PORT",     "5433")
+    user     = os.getenv("TSDB_USER",     "postgres")
+    password = os.getenv("TSDB_PASSWORD", "postgres")
+    db       = os.getenv("TSDB_DB",       "m6_thermal_tsdb")
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+
+# ---------------------------------------------------------------------------
+# Extract attention weights from AnomalyTransformer
+# ---------------------------------------------------------------------------
+
+def extract_mean_attention(model, signals_batch):
+    """
+    Extracts mean attention weights from AnomalyTransformer for a batch.
+
+    Takes the attention maps from all layers and heads,
+    averages them, then averages across the query dimension
+    to get one weight per timestep.
+
+    Parameters
+    ----------
+    model         : AnomalyTransformer instance
+    signals_batch : torch.Tensor of shape (B, C, T)
+
+    Returns
+    -------
+    np.ndarray of shape (B, T) — one weight per timestep per sample
+    """
+    import torch
+
+    model.eval()
+    with torch.no_grad():
+        # attn_maps shape: (n_layers, B, n_heads, T, T)
+        attn_maps = model.get_attention_maps(signals_batch)
+
+    # Average over layers and heads → (B, T, T)
+    attn_mean = attn_maps.mean(dim=0).mean(dim=1)
+
+    # Average over query dimension → (B, T)
+    # Each value = how much attention timestep t received on average
+    attn_per_timestep = attn_mean.mean(dim=1)
+
+    return attn_per_timestep.cpu().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Quick test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    print("Testing AttentionStore...")
+    store = AttentionStore()
+    print(f"Table created. Current row count: {store.count()}")
+
+    # Insert a fake window to verify it works
+    from datetime import timezone, timedelta
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    timestamps = [base + timedelta(seconds=i) for i in range(60)]
+    weights    = np.random.dirichlet(np.ones(60)).tolist()  # sum to 1
+
+    store.insert(
+        window_id  = 9999,
+        patient_id = 0,
+        timestamps = timestamps,
+        weights    = weights,
+        epoch      = 0,
+    )
+    print(f"Inserted test window. Row count now: {store.count()}")
+
+    top5 = store.top_k_timestamps(window_id=9999, patient_id=0, k=5)
+    print(f"Top-5 timestamps for test window:")
+    for ts, w in top5:
+        print(f"  {ts}  weight={w:.4f}")
+
+    print("\nAttentionStore A3 test passed.")
+</file>
+
+<file path="baselines.py">
+"""
+baselines.py
+Sprint 3 – Task 1 : Baseline Algorithms
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03 (Team 3)
+
+Implements three baseline algorithms for comparison against TAAE (MedAttnAID):
+  - Algorithm 6 : Supervised BiLSTM           (alg6)
+  - Algorithm 7 : Feature-based K-Means       (alg7)
+  - Algorithm 8 : TS-KMeans with DTW          (alg8)
+
+Each baseline produces window-level anomaly predictions compatible with Table I:
+  F1 (%), Precision (%), Recall (%), Individual Accuracy (%)
+
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("baselines")
+
+# ---------------------------------------------------------------------------
+# Constants 
+# ---------------------------------------------------------------------------
+WINDOW_SIZE = 60       # timesteps per window
+N_CHANNELS  = 3        # left_norm, right_norm, asymmetry
+CHANNEL_INDEX = {
+    "left_temperature":       0,
+    "right_temperature":      1,
+    "left_temperature_norm":  2,
+    "right_temperature_norm": 3,
+    "temp_asymmetry":         4,
+}
+DEFAULT_CHANNELS        = ["left_temperature_norm", "right_temperature_norm", "temp_asymmetry"]
+DEFAULT_CHANNEL_INDICES = [CHANNEL_INDEX[c] for c in DEFAULT_CHANNELS]
+
+SEED = 42
+
+
+# ===========================================================================
+# Data Loading  (mirrors thermal_npy_dataset.py)
+# ===========================================================================
+
+class ThermalNPYDataset(Dataset):
+    """
+    Loads windows from .npy files produced by Sprint 2 ETL.
+
+    Returns (signal_tensor [C, T], label_tensor [scalar]) per item,
+    exactly matching the format expected by train.py DataLoaders.
+    """
+
+    def __init__(
+        self,
+        npy_dir: Path,
+        patient_ids: List[int],
+        channels: List[str] = DEFAULT_CHANNELS,
+    ):
+        self.npy_dir    = Path(npy_dir)
+        self.ch_indices = [CHANNEL_INDEX[c] for c in channels]
+
+        signals_list, labels_list = [], []
+        for pid in patient_ids:
+            npy_path  = self.npy_dir / f"patient_{pid:02d}_windows.npy"
+            meta_path = self.npy_dir / f"patient_{pid:02d}_windows_meta.csv"
+
+            if not npy_path.exists():
+                log.warning(f"Missing: {npy_path} — skipping patient {pid}")
+                continue
+
+            arr  = np.load(npy_path)              # (N, 5, 60)
+            meta = pd.read_csv(meta_path)
+            arr  = arr[:, self.ch_indices, :]     # (N, C, 60)
+
+            signals_list.append(arr)
+            labels_list.append(meta["label"].values)
+
+        if not signals_list:
+            raise RuntimeError(
+                f"No .npy files found in {npy_dir} for patients {patient_ids}.\n"
+                "Check that Sprint 2 ETL has been run and --npy-dir is correct."
+            )
+
+        self.signals = np.concatenate(signals_list, axis=0).astype(np.float32)  # (N, C, T)
+        self.labels  = np.concatenate(labels_list,  axis=0).astype(np.int64)    # (N,)
+
+        log.info(
+            f"Loaded {len(self.labels)} windows from patients {patient_ids} | "
+            f"anomalies: {self.labels.sum()} / {len(self.labels)} "
+            f"({100*self.labels.mean():.1f}%)"
+        )
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.from_numpy(self.signals[idx]),
+            torch.tensor(self.labels[idx], dtype=torch.long),
+        )
+
+
+def make_splits(
+    npy_dir: Path,
+    patient_ids: List[int],
+    train_ratio: float = 0.70,
+    val_ratio:   float = 0.15,
+    seed: int = SEED,
+) -> Tuple[ThermalNPYDataset, ThermalNPYDataset, ThermalNPYDataset]:
+    """
+    Patient-level train/val/test split — same logic as ThermalTSDBDataModule.split().
+    Split is by patient to avoid data leakage.
+    """
+    rng = np.random.default_rng(seed)
+    ids = np.array(patient_ids)
+    rng.shuffle(ids)
+
+    n       = len(ids)
+    n_train = max(1, int(n * train_ratio))
+    n_val   = max(1, int(n * val_ratio))
+
+    train_ids = ids[:n_train].tolist()
+    val_ids   = ids[n_train : n_train + n_val].tolist()
+    test_ids  = ids[n_train + n_val :].tolist()
+
+    log.info(f"Patient split → train={train_ids} | val={val_ids} | test={test_ids}")
+
+    return (
+        ThermalNPYDataset(npy_dir, train_ids),
+        ThermalNPYDataset(npy_dir, val_ids),
+        ThermalNPYDataset(npy_dir, test_ids),
+    )
+
+
+def _compute_sample_weights(labels: np.ndarray) -> torch.Tensor:
+    """WeightedRandomSampler weights to balance class imbalance (~85/15)."""
+    counts  = np.bincount(labels)
+    weights = 1.0 / np.where(counts > 0, counts, 1)
+    return torch.from_numpy(weights[labels]).float()
+
+
+# ===========================================================================
+# Evaluation helpers
+# ===========================================================================
+
+def compute_metrics(
+    y_true:    np.ndarray,
+    y_pred:    np.ndarray,
+    patient_ids_per_window: Optional[np.ndarray] = None,
+    anomaly_pct_threshold:  float = 5.0,
+) -> Dict[str, float]:
+    """
+    Computes Table I metrics:
+      - F1 (%)
+      - Precision (%)
+      - Recall (%)
+      - Individual Accuracy (%) : subject classified as pathological
+        if anomaly_pct > threshold; all subjects must be classified correctly.
+
+    Parameters
+    ----------
+    y_true : (N,) ground truth window labels
+    y_pred : (N,) predicted window labels
+    patient_ids_per_window : (N,) patient id for each window (for Individual Acc.)
+    anomaly_pct_threshold  : % of anomalous windows needed to flag a patient
+    """
+    tp = ((y_pred == 1) & (y_true == 1)).sum()
+    fp = ((y_pred == 1) & (y_true == 0)).sum()
+    fn = ((y_pred == 0) & (y_true == 1)).sum()
+
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+
+    metrics = {
+        "F1 (%)":        round(float(f1)        * 100, 2),
+        "Precision (%)": round(float(precision)  * 100, 2),
+        "Recall (%)":    round(float(recall)     * 100, 2),
+    }
+
+    # Individual accuracy: classify each patient
+    if patient_ids_per_window is not None:
+        patient_ids = np.unique(patient_ids_per_window)
+        correct = 0
+        for pid in patient_ids:
+            mask        = (patient_ids_per_window == pid)
+            true_labels = y_true[mask]
+            pred_labels = y_pred[mask]
+
+            # Ground truth: patient is pathological if ANY window is anomalous
+            is_pathological_gt = int(true_labels.sum() > 0)
+
+            # Prediction: pathological if > threshold% windows flagged
+            anomaly_pct = 100.0 * pred_labels.mean()
+            is_pathological_pred = int(anomaly_pct > anomaly_pct_threshold)
+
+            if is_pathological_gt == is_pathological_pred:
+                correct += 1
+
+        metrics["Individual Acc. (%)"] = round(100 * correct / len(patient_ids), 2)
+    else:
+        metrics["Individual Acc. (%)"] = round(
+            100 * float((y_pred == y_true).mean()), 2
+        )
+
+    return metrics
+
+
+# ===========================================================================
+# Algorithm 6 — Supervised BiLSTM
+# ===========================================================================
+
+class BiLSTMClassifier(nn.Module):
+    """
+    Supervised BiLSTM anomaly classifier.
+
+    Architecture (Algorithm 6):
+      Input  : (B, C, T)
+      BiLSTM : 2 layers, hidden=64
+      Pool   : last hidden state (concat fwd + bwd → 128)
+      MLP    : 128 → 64 → 2 (binary classification)
+    """
+
+    def __init__(
+        self,
+        n_channels:  int   = N_CHANNELS,
+        window_size: int   = WINDOW_SIZE,
+        hidden_size: int   = 64,
+        num_layers:  int   = 2,
+        dropout:     float = 0.3,
+    ):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size   = n_channels,
+            hidden_size  = hidden_size,
+            num_layers   = num_layers,
+            batch_first  = True,
+            bidirectional= True,
+            dropout      = dropout if num_layers > 1 else 0.0,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x : (B, C, T) → logits : (B, 2)"""
+        # (B, C, T) → (B, T, C) for LSTM batch_first
+        x = x.permute(0, 2, 1)
+        out, (h_n, _) = self.lstm(x)
+
+        # Concat forward and backward last hidden states
+        # h_n shape: (num_layers * 2, B, hidden_size)
+        # Take last layer: h_n[-2] = forward, h_n[-1] = backward
+        h_fwd = h_n[-2]   # (B, hidden_size)
+        h_bwd = h_n[-1]   # (B, hidden_size)
+        h = torch.cat([h_fwd, h_bwd], dim=1)   # (B, hidden_size*2)
+        h = self.dropout(h)
+
+        return self.classifier(h)   # (B, 2)
+
+
+def run_bilstm(
+    train_ds: ThermalNPYDataset,
+    test_ds:  ThermalNPYDataset,
+    epochs:   int   = 30,
+    batch_size: int = 256,
+    lr:       float = 1e-3,
+    device:   Optional[torch.device] = None,
+    patient_ids_test: Optional[np.ndarray] = None,
+) -> Dict:
+    """
+    Trains and evaluates the Supervised BiLSTM baseline (Algorithm 6).
+
+    Returns dict with metrics + timing info.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    log.info("=" * 60)
+    log.info("BASELINE alg6 — Supervised BiLSTM")
+    log.info("=" * 60)
+
+    # Weighted sampler for class imbalance
+    train_weights = _compute_sample_weights(train_ds.labels)
+    sampler = WeightedRandomSampler(train_weights, len(train_weights), replacement=True)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, sampler=sampler, num_workers=0
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+
+    model     = BiLSTMClassifier().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Class weights for loss: compensate ~85/15 imbalance
+    class_counts = np.bincount(train_ds.labels)
+    class_weights = torch.tensor(
+        [1.0 / c if c > 0 else 1.0 for c in class_counts],
+        dtype=torch.float32
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=5, factor=0.5
+    )
+
+    t0 = time.perf_counter()
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        n_batches  = 0
+
+        for signals, labels in train_loader:
+            signals = signals.to(device)
+            labels  = labels.to(device)
+
+            optimizer.zero_grad()
+            logits = model(signals)
+            loss   = criterion(logits, labels)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            n_batches  += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        scheduler.step(avg_loss)
+
+        if epoch % 10 == 0:
+            log.info(f"  BiLSTM epoch {epoch:3d}/{epochs} | loss={avg_loss:.5f}")
+
+    train_time = time.perf_counter() - t0
+    log.info(f"  Training time: {train_time:.1f}s")
+
+    # ---- Evaluation -------------------------------------------------------
+    model.eval()
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for signals, labels in test_loader:
+            logits = model(signals.to(device))
+            preds  = logits.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.numpy())
+
+    y_pred = np.array(all_preds)
+    y_true = np.array(all_labels)
+
+    metrics = compute_metrics(y_true, y_pred, patient_ids_test)
+    metrics["Algorithm"]    = "Supervised BiLSTM"
+    metrics["Train time (s)"] = round(train_time, 1)
+
+    _log_metrics("BiLSTM (alg6)", metrics)
+    return metrics
+
+
+# ===========================================================================
+# Algorithm 7 — Feature-based K-Means
+# ===========================================================================
+
+def extract_features(signals: np.ndarray) -> np.ndarray:
+    """
+    Extracts hand-crafted statistical features per window for clustering.
+
+    Input  : (N, C, T)
+    Output : (N, F)  where F = C * 8 features per channel
+
+    Features per channel:
+      mean, std, min, max, range, skewness (approx), kurtosis (approx),
+      zero_crossings, mean_abs_diff (mean gradient magnitude)
+    """
+    N, C, T = signals.shape
+    features = []
+
+    for c in range(C):
+        ch = signals[:, c, :]   # (N, T)
+
+        mean_val  = ch.mean(axis=1)
+        std_val   = ch.std(axis=1)
+        min_val   = ch.min(axis=1)
+        max_val   = ch.max(axis=1)
+        rng_val   = max_val - min_val
+
+        # Approximate skewness: (mean - median) / std
+        median_val = np.median(ch, axis=1)
+        skew_val   = (mean_val - median_val) / (std_val + 1e-8)
+
+        # Approximate kurtosis: ratio of 4th moment to variance^2
+        centered   = ch - mean_val[:, None]
+        kurt_val   = (centered ** 4).mean(axis=1) / ((std_val ** 2 + 1e-8) ** 2)
+
+        # Zero crossings around mean
+        centered_signed = np.sign(centered)
+        zc = (np.diff(centered_signed, axis=1) != 0).sum(axis=1).astype(float)
+
+        # Mean absolute gradient
+        grad_mag = np.abs(np.diff(ch, axis=1)).mean(axis=1)
+
+        features.extend([
+            mean_val, std_val, min_val, max_val,
+            rng_val, skew_val, kurt_val, zc, grad_mag,
+        ])
+
+    return np.column_stack(features)   # (N, C*9)
+
+
+def run_feature_kmeans(
+    train_ds: ThermalNPYDataset,
+    test_ds:  ThermalNPYDataset,
+    n_clusters: int = 2,
+    patient_ids_test: Optional[np.ndarray] = None,
+) -> Dict:
+    """
+    Feature-based K-Means baseline (Algorithm 7).
+
+    Strategy:
+      1. Extract statistical features from training windows.
+      2. Fit K-Means (k=2) on healthy training windows only.
+      3. Assign cluster labels: the cluster with higher mean reconstruction
+         distance from healthy centroid is flagged as 'anomaly'.
+      4. Evaluate on test set.
+    """
+    log.info("=" * 60)
+    log.info("BASELINE alg7 — Feature-based K-Means")
+    log.info("=" * 60)
+
+    t0 = time.perf_counter()
+
+    # Extract features
+    train_features = extract_features(train_ds.signals)   # (N_train, F)
+    test_features  = extract_features(test_ds.signals)    # (N_test, F)
+
+    # Standardise features (critical for K-Means convergence)
+    scaler = StandardScaler()
+    train_features_scaled = scaler.fit_transform(train_features)
+    test_features_scaled  = scaler.transform(test_features)
+
+    # Fit K-Means on ALL training windows (supervised by cluster assignment)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=SEED, n_init=10)
+    train_cluster_labels = kmeans.fit_predict(train_features_scaled)
+
+    # Identify which cluster corresponds to 'anomaly':
+    # The cluster with a higher proportion of anomalous training windows
+    cluster_anomaly_ratios = []
+    for k in range(n_clusters):
+        mask  = (train_cluster_labels == k)
+        ratio = train_ds.labels[mask].mean() if mask.sum() > 0 else 0.0
+        cluster_anomaly_ratios.append(ratio)
+
+    anomaly_cluster = int(np.argmax(cluster_anomaly_ratios))
+    log.info(
+        f"  Cluster anomaly ratios: {[f'{r:.2f}' for r in cluster_anomaly_ratios]} "
+        f"→ anomaly cluster = {anomaly_cluster}"
+    )
+
+    # Predict on test set
+    test_cluster_labels = kmeans.predict(test_features_scaled)
+    y_pred = (test_cluster_labels == anomaly_cluster).astype(int)
+    y_true = test_ds.labels
+
+    train_time = time.perf_counter() - t0
+    log.info(f"  Training + inference time: {train_time:.2f}s")
+
+    metrics = compute_metrics(y_true, y_pred, patient_ids_test)
+    metrics["Algorithm"]      = "Feature K-Means"
+    metrics["Train time (s)"] = round(train_time, 2)
+
+    _log_metrics("Feature K-Means (alg7)", metrics)
+    return metrics
+
+
+# ===========================================================================
+# Algorithm 8 — TS-KMeans with DTW
+# ===========================================================================
+
+def run_tskmeans_dtw(
+    train_ds: ThermalNPYDataset,
+    test_ds:  ThermalNPYDataset,
+    n_clusters: int = 2,
+    max_iter:   int = 10,
+    n_init:     int = 2,
+    patient_ids_test: Optional[np.ndarray] = None,
+    subsample:  Optional[int] = 5000,
+) -> Dict:
+    """
+    TS-KMeans with DTW baseline (Algorithm 8).
+
+    Uses tslearn.clustering.TimeSeriesKMeans with metric='dtw'.
+
+    Note: DTW is O(T^2) per pair → very slow on large datasets.
+          subsample=5000 limits training to 5000 windows (stratified).
+
+    Parameters
+    ----------
+    subsample : int or None
+        Max training windows to use. None = use all (can take hours).
+    """
+    try:
+        from tslearn.clustering import TimeSeriesKMeans
+    except ImportError:
+        log.error(
+            "tslearn not installed. Run: pip install tslearn\n"
+            "TSKMeans baseline skipped."
+        )
+        return {"Algorithm": "TS-KMeans DTW", "error": "tslearn not installed"}
+
+    log.info("=" * 60)
+    log.info("BASELINE alg8 — TS-KMeans DTW")
+    log.info("=" * 60)
+
+    t0 = time.perf_counter()
+
+    # tslearn expects (N, T, C) — we have (N, C, T) so transpose
+    train_signals = train_ds.signals.transpose(0, 2, 1)   # (N, T, C)
+    test_signals  = test_ds.signals.transpose(0, 2, 1)    # (N, T, C)
+    train_labels  = train_ds.labels
+    test_labels   = test_ds.labels
+
+    # Optional stratified subsampling for speed (keeps class ratio)
+    if subsample is not None and len(train_labels) > subsample:
+        rng = np.random.default_rng(SEED)
+        idx_0 = np.where(train_labels == 0)[0]
+        idx_1 = np.where(train_labels == 1)[0]
+
+        # Maintain original class ratio in subsample
+        n1 = max(1, int(subsample * len(idx_1) / len(train_labels)))
+        n0 = subsample - n1
+
+        chosen_0 = rng.choice(idx_0, size=min(n0, len(idx_0)), replace=False)
+        chosen_1 = rng.choice(idx_1, size=min(n1, len(idx_1)), replace=False)
+        chosen   = np.concatenate([chosen_0, chosen_1])
+        rng.shuffle(chosen)
+
+        train_signals = train_signals[chosen]
+        train_labels  = train_labels[chosen]
+        log.info(
+            f"  Subsampled training to {len(train_labels)} windows "
+            f"({(train_labels==1).sum()} anomalies)"
+        )
+
+    log.info(
+        f"  Fitting TimeSeriesKMeans (k={n_clusters}, DTW, "
+        f"max_iter={max_iter}, n_init={n_init}) on {len(train_labels)} windows..."
+    )
+    log.info("  This may take several minutes. Please wait...")
+
+    model = TimeSeriesKMeans(
+        n_clusters = n_clusters,
+        metric     = "dtw",
+        max_iter   = max_iter,
+        n_init     = n_init,
+        random_state = SEED,
+        verbose    = 0,
+        n_jobs     = -1,   # use all CPU cores
+    )
+    train_cluster_labels = model.fit_predict(train_signals)
+
+    # Identify anomaly cluster (same logic as Feature K-Means)
+    cluster_anomaly_ratios = []
+    for k in range(n_clusters):
+        mask  = (train_cluster_labels == k)
+        ratio = train_labels[mask].mean() if mask.sum() > 0 else 0.0
+        cluster_anomaly_ratios.append(ratio)
+
+    anomaly_cluster = int(np.argmax(cluster_anomaly_ratios))
+    log.info(
+        f"  Cluster anomaly ratios: {[f'{r:.2f}' for r in cluster_anomaly_ratios]} "
+        f"→ anomaly cluster = {anomaly_cluster}"
+    )
+
+    # Predict on test set
+    log.info(f"  Predicting on {len(test_labels)} test windows...")
+    test_cluster_labels = model.predict(test_signals)
+    y_pred = (test_cluster_labels == anomaly_cluster).astype(int)
+    y_true = test_labels
+
+    train_time = time.perf_counter() - t0
+    log.info(f"  Total time: {train_time:.1f}s ({train_time/60:.1f} min)")
+
+    metrics = compute_metrics(y_true, y_pred, patient_ids_test)
+    metrics["Algorithm"]      = "TS-KMeans DTW"
+    metrics["Train time (s)"] = round(train_time, 1)
+
+    _log_metrics("TS-KMeans DTW (alg8)", metrics)
+    return metrics
+
+
+# ===========================================================================
+# Logging helper
+# ===========================================================================
+
+def _log_metrics(name: str, metrics: Dict):
+    log.info(
+        f"  {name} results:\n"
+        f"    F1           : {metrics.get('F1 (%)', 'N/A')}%\n"
+        f"    Precision    : {metrics.get('Precision (%)', 'N/A')}%\n"
+        f"    Recall       : {metrics.get('Recall (%)', 'N/A')}%\n"
+        f"    Individual   : {metrics.get('Individual Acc. (%)', 'N/A')}%"
+    )
+
+
+# ===========================================================================
+# Table I printer
+# ===========================================================================
+
+def print_table_i(results: List[Dict]):
+    """Prints the 3 baseline rows in Table I format."""
+    print("\n" + "=" * 80)
+    print("TABLE I (partial) — Anomaly Detection Performance — Baseline Results")
+    print("=" * 80)
+    header = (
+        f"{'Algorithm':<25} {'F1 (%)':>8} {'Precision (%)':>14} "
+        f"{'Recall (%)':>11} {'Indiv. Acc. (%)':>16}"
+    )
+    print(header)
+    print("-" * 80)
+    for r in results:
+        if "error" in r:
+            print(f"  {r['Algorithm']:<23}  ERROR: {r['error']}")
+            continue
+        print(
+            f"  {r['Algorithm']:<23} "
+            f"{r.get('F1 (%)', '-'):>8} "
+            f"{r.get('Precision (%)', '-'):>14} "
+            f"{r.get('Recall (%)', '-'):>11} "
+            f"{r.get('Individual Acc. (%)', '-'):>16}"
+        )
+    print("=" * 80)
+    print("Note: MedAttnAID (TAAE) row to be added by Team 2.\n")
+
+
+def save_table_i_csv(results: List[Dict], out_path: Path):
+    """Saves Table I baseline rows as CSV for Team 2/3 to append TAAE row."""
+    columns = ["Algorithm", "F1 (%)", "Precision (%)", "Recall (%)", "Individual Acc. (%)"]
+    rows = []
+    for r in results:
+        if "error" not in r:
+            rows.append({col: r.get(col, "") for col in columns})
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    log.info(f"Table I (baselines) saved → {out_path}")
+
+
+# ===========================================================================
+# CLI entry point
+# ===========================================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Sprint 3 Task 1 — Baseline algorithms for Table I"
+    )
+    p.add_argument(
+        "--npy-dir",
+        default="../Data-Wrangling/etl_output/npy",
+        help="Path to the NPY directory from Sprint 2 ETL (default: %(default)s)",
+    )
+    p.add_argument(
+        "--patients",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Patient IDs to use (default: auto-detect all in npy-dir)",
+    )
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Training epochs for BiLSTM (default: 30)",
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=256,
+        help="Batch size for BiLSTM training (default: 256)",
+    )
+    p.add_argument(
+        "--dtw-subsample",
+        type=int,
+        default=5000,
+        help="Max training windows for TSKMeans DTW (default: 5000, set 0 for all)",
+    )
+    p.add_argument(
+        "--skip-tskmeans",
+        action="store_true",
+        help="Skip TSKMeans DTW (useful when dataset is very large)",
+    )
+    p.add_argument(
+        "--save-csv",
+        action="store_true",
+        help="Save Table I rows to sprint3_output/table_I_baselines.csv",
+    )
+    p.add_argument(
+        "--out-dir",
+        default="sprint3_output",
+        help="Output directory for CSV results (default: sprint3_output)",
+    )
+    return p.parse_args()
+
+
+def auto_detect_patients(npy_dir: Path) -> List[int]:
+    """Scan npy_dir for patient_XX_windows.npy and return found patient IDs."""
+    found = sorted([
+        int(p.stem.split("_")[1])
+        for p in npy_dir.glob("patient_*_windows.npy")
+    ])
+    if not found:
+        raise RuntimeError(
+            f"No patient_XX_windows.npy files found in {npy_dir}.\n"
+            "Check --npy-dir path."
+        )
+    return found
+
+
+def main():
+    args    = parse_args()
+    npy_dir = Path(args.npy_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device: {device}")
+
+    # Auto-detect patients if not specified
+    patient_ids = args.patients or auto_detect_patients(npy_dir)
+    log.info(f"Using patients: {patient_ids}")
+
+    if len(patient_ids) < 3:
+        log.warning(
+            f"Only {len(patient_ids)} patient(s) found. "
+            "Patient-level split requires at least 3 patients for meaningful "
+            "train/val/test. Results may be unreliable."
+        )
+
+    # Build datasets
+    train_ds, val_ds, test_ds = make_splits(npy_dir, patient_ids)
+
+    # Build per-window patient ID arrays for Individual Accuracy
+    # Reconstruct from per-patient datasets
+    def get_patient_ids_array(npy_dir: Path, patient_ids: List[int]) -> np.ndarray:
+        """Returns array of shape (N,) with patient_id for each window."""
+        ids = []
+        for pid in patient_ids:
+            meta_path = npy_dir / f"patient_{pid:02d}_windows_meta.csv"
+            if meta_path.exists():
+                meta = pd.read_csv(meta_path)
+                ids.extend([pid] * len(meta))
+        return np.array(ids)
+
+    # Recover which patients belong to test split (from make_splits determinism)
+    rng = np.random.default_rng(SEED)
+    ids_shuffled = np.array(patient_ids)
+    rng.shuffle(ids_shuffled)
+    n_train = max(1, int(len(patient_ids) * 0.70))
+    n_val   = max(1, int(len(patient_ids) * 0.15))
+    test_patient_ids = ids_shuffled[n_train + n_val:].tolist()
+    patient_ids_test = get_patient_ids_array(npy_dir, test_patient_ids)
+
+    # Pad to match test_ds length if needed
+    if len(patient_ids_test) != len(test_ds):
+        log.warning(
+            "patient_ids_test length mismatch — Individual Accuracy "
+            "will use window-level accuracy instead."
+        )
+        patient_ids_test = None
+
+    # Run baselines
+    results = []
+    dtw_subsample = args.dtw_subsample if args.dtw_subsample > 0 else None
+
+    # alg6 — Supervised BiLSTM
+    r_bilstm = run_bilstm(
+        train_ds         = train_ds,
+        test_ds          = test_ds,
+        epochs           = args.epochs,
+        batch_size       = args.batch_size,
+        device           = device,
+        patient_ids_test = patient_ids_test,
+    )
+    results.append(r_bilstm)
+
+    # alg7 — Feature K-Means
+    r_kmeans = run_feature_kmeans(
+        train_ds         = train_ds,
+        test_ds          = test_ds,
+        patient_ids_test = patient_ids_test,
+    )
+    results.append(r_kmeans)
+
+    # alg8 — TS-KMeans DTW (optional)
+    if not args.skip_tskmeans:
+        r_tskmeans = run_tskmeans_dtw(
+            train_ds         = train_ds,
+            test_ds          = test_ds,
+            subsample        = dtw_subsample,
+            patient_ids_test = patient_ids_test,
+        )
+        results.append(r_tskmeans)
+    else:
+        log.info("TSKMeans DTW skipped (--skip-tskmeans flag set).")
+
+    # Print and optionally save Table I
+    print_table_i(results)
+
+    if args.save_csv:
+        csv_path = out_dir / "table_I_baselines.csv"
+        save_table_i_csv(results, csv_path)
+
+    return results
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="benchmark_A2.py">
+"""
+benchmark_a2.py
+
+Sprint 3 – Task A2 : DB vs NPY fetch speed comparison
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+What this script does
+---------------------
+Calls the existing benchmark_vs_npy() function from thermal_tsdb_dataset.py
+across multiple batch sizes, then prints and saves a comparison table
+(ms/batch and samples/s) for TimescaleDB vs raw .npy files.
+
+Output
+------
+  sprint3_output/a2_benchmark_results.csv   ← the comparison table
+  sprint3_output/a2_benchmark_results.json  ← full raw results
+
+Usage
+-----
+  # From inside the Data-Loader folder:
+  python benchmark_a2.py
+
+  # With custom paths:
+  python benchmark_a2.py --npy-dir "../Data-Wrangling/etl_output/npy" --patients 5
+"""
+
+import argparse
+import json
+import os
+import time
+import logging
+from pathlib import Path
+
+import numpy as np
+import psycopg2
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("benchmark_a2")
+
+
+def _build_dsn() -> str:
+    host     = os.getenv("TSDB_HOST",     "localhost")
+    port     = os.getenv("TSDB_PORT",     "5433")
+    user     = os.getenv("TSDB_USER",     "postgres")
+    password = os.getenv("TSDB_PASSWORD", "postgres")
+    db       = os.getenv("TSDB_DB",       "m6_thermal_tsdb")
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+
+def get_all_patient_ids(dsn: str):
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT patient_id FROM subjects ORDER BY patient_id;")
+            return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def run_benchmark(dsn, npy_dir, patient_ids, batch_sizes, n_runs=3):
+    """
+    Runs benchmark_vs_npy() for each batch size, n_runs times,
+    and returns averaged results.
+    """
+    from thermal_tsdb_dataset import benchmark_vs_npy
+
+    all_results = []
+
+    for batch_size in batch_sizes:
+        log.info(f"\n{'='*50}")
+        log.info(f"Batch size = {batch_size}")
+        log.info(f"{'='*50}")
+
+        db_times, npy_times = [], []
+        db_rates, npy_rates = [], []
+
+        for run in range(n_runs):
+            log.info(f"  Run {run+1}/{n_runs}...")
+            result = benchmark_vs_npy(
+                dsn=dsn,
+                npy_dir=Path(npy_dir),
+                patient_ids=patient_ids,
+                batch_size=batch_size,
+                num_workers=0,
+                n_epochs=1,
+            )
+            db_times.append(result["db_epoch_s"])
+            npy_times.append(result["npy_epoch_s"])
+            db_rates.append(result["db_samples_per_s"])
+            npy_rates.append(result["npy_samples_per_s"])
+
+        # Calculate ms per batch
+        # total batches = total samples / batch_size (approx)
+        from thermal_tsdb_dataset import ThermalTSDBDataset
+        ds = ThermalTSDBDataset(dsn=dsn, patient_ids=patient_ids)
+        n_batches = len(ds) / batch_size
+
+        db_ms_per_batch  = (np.mean(db_times)  * 1000) / n_batches
+        npy_ms_per_batch = (np.mean(npy_times) * 1000) / n_batches
+
+        row = {
+            "batch_size":          batch_size,
+            "db_epoch_s":          round(np.mean(db_times), 3),
+            "npy_epoch_s":         round(np.mean(npy_times), 3),
+            "db_ms_per_batch":     round(db_ms_per_batch, 2),
+            "npy_ms_per_batch":    round(npy_ms_per_batch, 2),
+            "db_samples_per_s":    round(np.mean(db_rates), 0),
+            "npy_samples_per_s":   round(np.mean(npy_rates), 0),
+            "speedup_npy_over_db": round(np.mean(db_times) / np.mean(npy_times), 2),
+        }
+        all_results.append(row)
+
+    return all_results
+
+
+def print_table(results):
+    """Prints a formatted comparison table to the console."""
+    print("\n" + "="*85)
+    print("A2 BENCHMARK RESULTS — TimescaleDB vs Raw NPY Files")
+    print("="*85)
+    print(f"{'Batch':>6} | {'DB ms/batch':>12} | {'NPY ms/batch':>13} | "
+          f"{'DB samples/s':>13} | {'NPY samples/s':>14} | {'NPY speedup':>11}")
+    print("-"*85)
+    for r in results:
+        print(
+            f"{r['batch_size']:>6} | "
+            f"{r['db_ms_per_batch']:>12.2f} | "
+            f"{r['npy_ms_per_batch']:>13.2f} | "
+            f"{r['db_samples_per_s']:>13,.0f} | "
+            f"{r['npy_samples_per_s']:>14,.0f} | "
+            f"{r['speedup_npy_over_db']:>10.1f}x"
+        )
+    print("="*85)
+    print("Interpretation: NPY speedup > 1 means raw files are faster than DB.")
+    print("This is expected — DB adds query parsing overhead vs sequential disk reads.")
+    print()
+
+
+def save_csv(results, out_path: Path):
+    import csv
+    fieldnames = list(results[0].keys())
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+    log.info(f"CSV saved → {out_path}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Sprint 3 A2 — DB vs NPY Benchmark")
+    p.add_argument("--npy-dir",   default="../Data-Wrangling/etl_output/npy",
+                   help="Path to folder containing patient_XX_windows.npy files")
+    p.add_argument("--patients",  type=int, default=None,
+                   help="Number of patients to use (default: all)")
+    p.add_argument("--runs",      type=int, default=3,
+                   help="Number of runs per batch size for averaging (default: 3)")
+    p.add_argument("--out-dir",   default="sprint3_output")
+    return p.parse_args()
+
+
+def main():
+    args   = parse_args()
+    dsn    = _build_dsn()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get patient IDs
+    all_patients = get_all_patient_ids(dsn)
+    patient_ids  = all_patients[:args.patients] if args.patients else all_patients
+    log.info(f"Using {len(patient_ids)} patients: {patient_ids}")
+
+    # Verify NPY directory exists
+    npy_dir = Path(args.npy_dir)
+    if not npy_dir.exists():
+        log.error(f"NPY directory not found: {npy_dir}")
+        log.error("Run etl_pipeline.py first, then adjust --npy-dir to point to the output.")
+        return
+
+    # Batch sizes to test (as required by A2)
+    batch_sizes = [16, 32, 64, 128]
+
+    log.info(f"Starting benchmark: {len(batch_sizes)} batch sizes × {args.runs} runs each")
+    results = run_benchmark(dsn, npy_dir, patient_ids, batch_sizes, n_runs=args.runs)
+
+    # Print table to console
+    print_table(results)
+
+    # Save CSV
+    csv_path = out_dir / "a2_benchmark_results.csv"
+    save_csv(results, csv_path)
+
+    # Save full JSON
+    json_path = out_dir / "a2_benchmark_results.json"
+    with open(json_path, "w") as f:
+        json.dump({
+            "config": {
+                "patient_ids":  patient_ids,
+                "batch_sizes":  batch_sizes,
+                "n_runs":       args.runs,
+                "npy_dir":      str(npy_dir),
+            },
+            "results": results
+        }, f, indent=2)
+    log.info(f"JSON saved → {json_path}")
+
+    log.info("\nA2 DONE. Deliverables:")
+    log.info(f"  Table (CSV)  → {csv_path}")
+    log.info(f"  Raw data     → {json_path}")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="evaluate.py">
+"""
+evaluate.py
+
+Sprint 3 evaluation for the TAAE skin-temperature anomaly detector.
+
+Outputs:
+  - sprint3_output/table_I_metrics.csv
+  - sprint3_output/table_II_reconstruction.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import re
+from pathlib import Path
+from typing import Iterable, Optional
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+from model import TAAE
+from thermal_npy_dataset import DEFAULT_CHANNELS, ThermalNPYDataset
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("evaluate")
+
+WINDOW_SIZE = 60
+SEED = 42
+
+
+class ThermalNPYDatasetWithMetadata(ThermalNPYDataset):
+    """ThermalNPYDataset plus patient/window metadata needed for subject metrics."""
+
+    def _load_all(self):
+        all_signals = []
+        all_labels = []
+        all_meta = []
+
+        for pid in self.patient_ids:
+            npy_path = self.npy_dir / f"patient_{pid:02d}_windows.npy"
+            meta_path = self.npy_dir / f"patient_{pid:02d}_windows_meta.csv"
+
+            if not npy_path.exists():
+                log.warning("Missing file: %s", npy_path)
+                continue
+            if not meta_path.exists():
+                raise FileNotFoundError(f"Missing metadata file: {meta_path}")
+
+            arr = np.load(npy_path)
+            meta = pd.read_csv(meta_path)
+
+            if "label" not in meta.columns:
+                raise ValueError(f"{meta_path} must contain a 'label' column")
+            if len(meta) != len(arr):
+                raise ValueError(
+                    f"Metadata/window count mismatch for patient {pid}: "
+                    f"{len(meta)} rows vs {len(arr)} windows"
+                )
+
+            arr = arr[:, self.ch_indices, :]
+            meta = meta.copy()
+            meta["patient_id"] = pid
+            if "window_id" not in meta.columns:
+                meta["window_id"] = np.arange(len(meta))
+
+            all_signals.append(arr)
+            all_labels.append(meta["label"].values)
+            all_meta.append(meta)
+
+        if not all_signals:
+            raise RuntimeError(
+                f"No .npy files found in {self.npy_dir} for patients {self.patient_ids}."
+            )
+
+        self.metadata = pd.concat(all_meta, ignore_index=True)
+        self.patient_ids_per_window = self.metadata["patient_id"].to_numpy(np.int64)
+        self.window_ids = self.metadata["window_id"].to_numpy(np.int64)
+
+        return (
+            np.concatenate(all_signals, axis=0).astype(np.float32),
+            np.concatenate(all_labels, axis=0).astype(np.int64),
+        )
+
+
+class ReconstructionAccumulator:
+    """Streaming aggregate for MAE, RMSE, Pearson r, and cosine similarity."""
+
+    def __init__(self) -> None:
+        self.n_windows = 0
+        self.n_values = 0
+        self.sum_abs = 0.0
+        self.sum_sq_err = 0.0
+        self.sum_x = 0.0
+        self.sum_y = 0.0
+        self.sum_x2 = 0.0
+        self.sum_y2 = 0.0
+        self.sum_xy = 0.0
+
+    def update(self, x: torch.Tensor, x_hat: torch.Tensor) -> None:
+        if x.numel() == 0:
+            return
+
+        x = x.detach().double().cpu()
+        x_hat = x_hat.detach().double().cpu()
+        err = x - x_hat
+
+        self.n_windows += int(x.shape[0])
+        self.n_values += int(x.numel())
+        self.sum_abs += float(err.abs().sum().item())
+        self.sum_sq_err += float((err * err).sum().item())
+        self.sum_x += float(x.sum().item())
+        self.sum_y += float(x_hat.sum().item())
+        self.sum_x2 += float((x * x).sum().item())
+        self.sum_y2 += float((x_hat * x_hat).sum().item())
+        self.sum_xy += float((x * x_hat).sum().item())
+
+    def as_row(self, split_name: str, healthy_windows: int, anomalous_windows: int) -> dict:
+        if self.n_values == 0:
+            return {
+                "Split": split_name,
+                "Windows": 0,
+                "Healthy Windows": healthy_windows,
+                "Anomalous Windows": anomalous_windows,
+                "MAE": np.nan,
+                "RMSE": np.nan,
+                "Pearson Correlation": np.nan,
+                "Cosine Similarity": np.nan,
+            }
+
+        n = float(self.n_values)
+        mae = self.sum_abs / n
+        rmse = float(np.sqrt(self.sum_sq_err / n))
+
+        pearson_num = self.sum_xy - (self.sum_x * self.sum_y / n)
+        pearson_den_x = self.sum_x2 - (self.sum_x * self.sum_x / n)
+        pearson_den_y = self.sum_y2 - (self.sum_y * self.sum_y / n)
+        pearson_den = np.sqrt(max(pearson_den_x, 0.0) * max(pearson_den_y, 0.0))
+        pearson = pearson_num / pearson_den if pearson_den > 0 else np.nan
+
+        cosine_den = np.sqrt(self.sum_x2) * np.sqrt(self.sum_y2)
+        cosine = self.sum_xy / cosine_den if cosine_den > 0 else np.nan
+
+        return {
+            "Split": split_name,
+            "Windows": self.n_windows,
+            "Healthy Windows": healthy_windows,
+            "Anomalous Windows": anomalous_windows,
+            "MAE": round(float(mae), 8),
+            "RMSE": round(float(rmse), 8),
+            "Pearson Correlation": round(float(pearson), 8),
+            "Cosine Similarity": round(float(cosine), 8),
+        }
+
+
+def discover_patient_ids(npy_dir: Path) -> list[int]:
+    patient_ids: list[int] = []
+    pattern = re.compile(r"patient_(\d+)_windows\.npy$")
+    for path in sorted(npy_dir.glob("patient_*_windows.npy")):
+        match = pattern.match(path.name)
+        if match:
+            patient_ids.append(int(match.group(1)))
+    if not patient_ids:
+        raise RuntimeError(f"No patient_XX_windows.npy files found in {npy_dir}")
+    return patient_ids
+
+
+def split_patient_ids(
+    patient_ids: Iterable[int],
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+    seed: int = SEED,
+) -> tuple[list[int], list[int], list[int]]:
+    ids = np.array(list(patient_ids), dtype=int)
+    if len(ids) < 3:
+        raise ValueError("At least 3 patients are required for train/val/test evaluation")
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(ids)
+
+    n_train = max(1, int(len(ids) * train_ratio))
+    n_val = max(1, int(len(ids) * val_ratio))
+    if n_train + n_val >= len(ids):
+        n_val = max(1, len(ids) - n_train - 1)
+    if n_train + n_val >= len(ids):
+        n_train = max(1, len(ids) - n_val - 1)
+
+    train_ids = ids[:n_train].tolist()
+    val_ids = ids[n_train : n_train + n_val].tolist()
+    test_ids = ids[n_train + n_val :].tolist()
+    return train_ids, val_ids, test_ids
+
+
+def build_loader(dataset, batch_size: int) -> DataLoader:
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+
+def load_model(checkpoint_path: Path, n_channels: int, device: torch.device) -> TAAE:
+    model = TAAE(n_channels=n_channels, window_size=WINDOW_SIZE).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    if any(str(k).startswith("module.") for k in state_dict.keys()):
+        state_dict = {
+            str(k)[len("module.") :] if str(k).startswith("module.") else str(k): v
+            for k, v in state_dict.items()
+        }
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def reconstruction_score(x: torch.Tensor, x_hat: torch.Tensor, metric: str) -> torch.Tensor:
+    if metric == "mae":
+        return (x - x_hat).abs().mean(dim=(1, 2))
+    if metric == "mse":
+        return ((x - x_hat) ** 2).mean(dim=(1, 2))
+    raise ValueError(f"Unsupported score metric: {metric}")
+
+
+def channel_reconstruction_score(
+    x: torch.Tensor, x_hat: torch.Tensor, metric: str
+) -> torch.Tensor:
+    if metric == "mae":
+        return (x - x_hat).abs().mean(dim=2)
+    if metric == "mse":
+        return ((x - x_hat) ** 2).mean(dim=2)
+    raise ValueError(f"Unsupported score metric: {metric}")
+
+
+@torch.no_grad()
+def collect_scores(
+    model: TAAE,
+    dataset: ThermalNPYDatasetWithMetadata,
+    batch_size: int,
+    device: torch.device,
+    score_metric: str,
+) -> dict:
+    loader = build_loader(dataset, batch_size)
+    losses = []
+    channel_losses = []
+    labels = []
+
+    for signals, batch_labels in loader:
+        signals = signals.to(device)
+        x_hat, _ = model(signals)
+        losses.append(reconstruction_score(signals, x_hat, score_metric).cpu().numpy())
+        channel_losses.append(
+            channel_reconstruction_score(signals, x_hat, score_metric).cpu().numpy()
+        )
+        labels.append(batch_labels.numpy())
+
+    return {
+        "losses": np.concatenate(losses),
+        "channel_losses": np.concatenate(channel_losses),
+        "labels": np.concatenate(labels).astype(np.int64),
+        "patient_ids": dataset.patient_ids_per_window.astype(np.int64),
+    }
+
+
+@torch.no_grad()
+def reconstruction_rows(
+    model: TAAE,
+    datasets: dict[str, tuple[ThermalNPYDatasetWithMetadata, Optional[int]]],
+    batch_size: int,
+    device: torch.device,
+) -> list[dict]:
+    rows = []
+
+    for split_name, (dataset, label_filter) in datasets.items():
+        acc = ReconstructionAccumulator()
+        labels_all = dataset._labels
+        healthy_windows = int((labels_all == 0).sum())
+        anomalous_windows = int((labels_all == 1).sum())
+
+        for signals, labels in build_loader(dataset, batch_size):
+            if label_filter is not None:
+                mask = labels == label_filter
+                if mask.sum().item() == 0:
+                    continue
+                signals = signals[mask]
+
+            signals = signals.to(device)
+            x_hat, _ = model(signals)
+            acc.update(signals, x_hat)
+
+        if label_filter == 0:
+            row_healthy = int(acc.n_windows)
+            row_anomalous = 0
+        elif label_filter == 1:
+            row_healthy = 0
+            row_anomalous = int(acc.n_windows)
+        else:
+            row_healthy = healthy_windows
+            row_anomalous = anomalous_windows
+
+        rows.append(acc.as_row(split_name, row_healthy, row_anomalous))
+
+    return rows
+
+
+def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+
+    return {
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN": tn,
+        "F1 (%)": round(100.0 * f1, 2),
+        "Precision (%)": round(100.0 * precision, 2),
+        "Recall (%)": round(100.0 * recall, 2),
+    }
+
+
+def subject_summary(
+    labels: np.ndarray, preds: np.ndarray, patient_ids: np.ndarray
+) -> pd.DataFrame:
+    rows = []
+    for pid in np.unique(patient_ids):
+        mask = patient_ids == pid
+        rows.append(
+            {
+                "patient_id": int(pid),
+                "true_pathological": int(labels[mask].sum() > 0),
+                "anomaly_pct": 100.0 * float(preds[mask].mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def optimize_subject_threshold(
+    labels: np.ndarray,
+    preds: np.ndarray,
+    patient_ids: np.ndarray,
+    fallback: float,
+) -> float:
+    summary = subject_summary(labels, preds, patient_ids)
+    if summary["true_pathological"].nunique() < 2:
+        log.warning(
+            "Validation split has one subject class only; using fallback subject threshold %.2f%%",
+            fallback,
+        )
+        return float(fallback)
+
+    best_threshold = float(fallback)
+    best_tuple = (-1.0, -1.0, 0.0)
+    for threshold in np.linspace(0.0, 100.0, 1001):
+        y_true = summary["true_pathological"].to_numpy(np.int64)
+        y_pred = (summary["anomaly_pct"].to_numpy() > threshold).astype(np.int64)
+        metrics = binary_metrics(y_true, y_pred)
+        accuracy = float((y_true == y_pred).mean())
+        candidate = (metrics["F1 (%)"], accuracy, -threshold)
+        if candidate > best_tuple:
+            best_tuple = candidate
+            best_threshold = float(threshold)
+
+    return best_threshold
+
+
+def subject_accuracy(
+    labels: np.ndarray,
+    preds: np.ndarray,
+    patient_ids: np.ndarray,
+    threshold: float,
+) -> float:
+    summary = subject_summary(labels, preds, patient_ids)
+    y_true = summary["true_pathological"].to_numpy(np.int64)
+    y_pred = (summary["anomaly_pct"].to_numpy() > threshold).astype(np.int64)
+    return round(100.0 * float((y_true == y_pred).mean()), 2)
+
+
+def channel_index(channels: list[str], prefix: str) -> Optional[int]:
+    for idx, channel in enumerate(channels):
+        if channel.startswith(prefix):
+            return idx
+    return None
+
+
+def channel_fpr_for_healthy_subjects(
+    train_scores: dict,
+    test_scores: dict,
+    channels: list[str],
+    percentile: float,
+) -> tuple[float, float, str]:
+    labels_train = train_scores["labels"]
+    labels_test = test_scores["labels"]
+    patient_ids_test = test_scores["patient_ids"]
+
+    left_idx = channel_index(channels, "left")
+    right_idx = channel_index(channels, "right")
+    if left_idx is None or right_idx is None:
+        return np.nan, np.nan, "left/right channels not present"
+
+    healthy_train = labels_train == 0
+    left_threshold = np.percentile(
+        train_scores["channel_losses"][healthy_train, left_idx], percentile
+    )
+    right_threshold = np.percentile(
+        train_scores["channel_losses"][healthy_train, right_idx], percentile
+    )
+
+    healthy_subject_ids = []
+    for pid in np.unique(patient_ids_test):
+        mask = patient_ids_test == pid
+        if labels_test[mask].sum() == 0:
+            healthy_subject_ids.append(pid)
+
+    if healthy_subject_ids:
+        healthy_mask = np.isin(patient_ids_test, healthy_subject_ids)
+        population = "test healthy subjects"
+    else:
+        healthy_mask = labels_test == 0
+        population = "test healthy windows (no fully healthy test subject found)"
+
+    if healthy_mask.sum() == 0:
+        return np.nan, np.nan, population
+
+    left_fpr = 100.0 * float(
+        (test_scores["channel_losses"][healthy_mask, left_idx] > left_threshold).mean()
+    )
+    right_fpr = 100.0 * float(
+        (test_scores["channel_losses"][healthy_mask, right_idx] > right_threshold).mean()
+    )
+    return round(left_fpr, 2), round(right_fpr, 2), population
+
+
+def save_csv(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    log.info("Saved %s", path)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate Sprint 3 TAAE anomaly detector")
+    parser.add_argument("--npy-dir", default="../Data-Wrangling/etl_output/npy")
+    parser.add_argument("--checkpoint", default="sprint3_output/best_model.pt")
+    parser.add_argument("--out-dir", default="sprint3_output")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--percentile", type=float, default=85.0)
+    parser.add_argument("--subject-threshold-fallback", type=float, default=5.0)
+    parser.add_argument("--score-metric", choices=["mse", "mae"], default="mse")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--train-ratio", type=float, default=0.70)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--patients", nargs="*", type=int, default=None)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    npy_dir = Path(args.npy_dir)
+    out_dir = Path(args.out_dir)
+    checkpoint_path = Path(args.checkpoint)
+    channels = list(DEFAULT_CHANNELS)
+
+    patient_ids = args.patients if args.patients else discover_patient_ids(npy_dir)
+    train_ids, val_ids, test_ids = split_patient_ids(
+        patient_ids,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+    )
+    log.info("Patient split -> train=%s | val=%s | test=%s", train_ids, val_ids, test_ids)
+
+    train_ds = ThermalNPYDatasetWithMetadata(npy_dir, train_ids, channels=channels)
+    val_ds = ThermalNPYDatasetWithMetadata(npy_dir, val_ids, channels=channels)
+    test_ds = ThermalNPYDatasetWithMetadata(npy_dir, test_ids, channels=channels)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Device: %s", device)
+    model = load_model(checkpoint_path, n_channels=len(channels), device=device)
+
+    train_scores = collect_scores(
+        model, train_ds, args.batch_size, device, args.score_metric
+    )
+    val_scores = collect_scores(model, val_ds, args.batch_size, device, args.score_metric)
+    test_scores = collect_scores(
+        model, test_ds, args.batch_size, device, args.score_metric
+    )
+
+    healthy_train_losses = train_scores["losses"][train_scores["labels"] == 0]
+    if len(healthy_train_losses) == 0:
+        raise RuntimeError("Training split has no healthy windows for threshold calibration")
+
+    window_threshold = float(np.percentile(healthy_train_losses, args.percentile))
+    log.info(
+        "Window anomaly threshold (%s, %.1fth percentile of healthy train): %.8f",
+        args.score_metric,
+        args.percentile,
+        window_threshold,
+    )
+
+    val_preds = (val_scores["losses"] > window_threshold).astype(np.int64)
+    test_preds = (test_scores["losses"] > window_threshold).astype(np.int64)
+    optimal_subject_threshold = optimize_subject_threshold(
+        val_scores["labels"],
+        val_preds,
+        val_scores["patient_ids"],
+        fallback=args.subject_threshold_fallback,
+    )
+
+    anomaly_metrics = binary_metrics(test_scores["labels"], test_preds)
+    anomaly_metrics["Algorithm"] = "TAAE"
+    anomaly_metrics["Window Loss Metric"] = args.score_metric.upper()
+    anomaly_metrics["Window Loss Threshold"] = round(window_threshold, 8)
+    anomaly_metrics["Calibration Percentile"] = args.percentile
+    anomaly_metrics["Optimal Subject Threshold (%)"] = round(
+        optimal_subject_threshold, 2
+    )
+    anomaly_metrics["Individual Acc. (%)"] = subject_accuracy(
+        test_scores["labels"],
+        test_preds,
+        test_scores["patient_ids"],
+        optimal_subject_threshold,
+    )
+
+    left_fpr, right_fpr, fpr_population = channel_fpr_for_healthy_subjects(
+        train_scores, test_scores, channels, args.percentile
+    )
+    anomaly_metrics["Left Channel FPR Healthy (%)"] = left_fpr
+    anomaly_metrics["Right Channel FPR Healthy (%)"] = right_fpr
+    anomaly_metrics["Channel FPR Population"] = fpr_population
+
+    table_i_columns = [
+        "Algorithm",
+        "Window Loss Metric",
+        "Window Loss Threshold",
+        "Calibration Percentile",
+        "F1 (%)",
+        "Precision (%)",
+        "Recall (%)",
+        "Individual Acc. (%)",
+        "Optimal Subject Threshold (%)",
+        "TP",
+        "FP",
+        "FN",
+        "TN",
+        "Left Channel FPR Healthy (%)",
+        "Right Channel FPR Healthy (%)",
+        "Channel FPR Population",
+    ]
+    table_i_row = {column: anomaly_metrics[column] for column in table_i_columns}
+    save_csv([table_i_row], out_dir / "table_I_metrics.csv")
+
+    table_ii_rows = reconstruction_rows(
+        model,
+        {
+            "Training": (train_ds, None),
+            "Validation": (val_ds, None),
+            "Test-Healthy": (test_ds, 0),
+            "Test-Anomalous": (test_ds, 1),
+        },
+        args.batch_size,
+        device,
+    )
+    save_csv(table_ii_rows, out_dir / "table_II_reconstruction.csv")
+
+    print("\nTable I - TAAE anomaly detection")
+    for key in [
+        "F1 (%)",
+        "Precision (%)",
+        "Recall (%)",
+        "Individual Acc. (%)",
+        "Left Channel FPR Healthy (%)",
+        "Right Channel FPR Healthy (%)",
+    ]:
+        print(f"  {key}: {table_i_row[key]}")
+
+    print("\nTable II - reconstruction quality")
+    for row in table_ii_rows:
+        print(
+            f"  {row['Split']}: MAE={row['MAE']}, RMSE={row['RMSE']}, "
+            f"r={row['Pearson Correlation']}, cosine={row['Cosine Similarity']}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="loss.py">
+"""
+loss.py
+Sprint 3 – Deliverable 2 : Loss Functions
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Implements Algorithm 2 (algorithm2_cploss.txt) exactly, plus the 3 ablation
+variants required by Table IV.
+
+Classes
+-------
+CPLoss          Full Clinical Pattern Loss (Equation 12)
+                L_CP = λ_fidelity * L_fid_norm
+                     + λ_pattern  * L_pat_norm
+                     + λ_trend    * L_trend_norm
+
+MSEOnlyLoss     Baseline: plain MSE, no normalisation
+MSEPatternLoss  MSE + Pattern (equal weights 0.5 / 0.5)
+MSETrendLoss    MSE + Trend   (equal weights 0.5 / 0.5)
+
+All losses accept an optional `mask` tensor (B, T) that is True where a
+sample is interpolated — those positions are down-weighted by 0.5.
+
+Usage
+-----
+    from loss import CPLoss
+    criterion = CPLoss()
+    loss = criterion(x, x_hat, mask=interp_mask)
+"""
+
+from __future__ import annotations
+import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# Helper : apply interpolation mask
+# ---------------------------------------------------------------------------
+def _apply_mask(error: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """
+    error : (B, C, T)   point-wise squared (or absolute) error
+    mask  : (B, T) bool — True where sample is interpolated
+    Returns weighted error with same shape.
+    """
+    if mask is None:
+        return error
+    # Expand mask to (B, 1, T) so it broadcasts over channels
+    w = torch.ones_like(mask, dtype=error.dtype)
+    w[mask] = 0.5                          # down-weight interpolated points
+    return error * w.unsqueeze(1)          # (B, C, T)
+
+
+# ---------------------------------------------------------------------------
+# 1. Fidelity Loss  (Equation 15)
+# ---------------------------------------------------------------------------
+def _fidelity_loss(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    L_fidelity = mean over (T, C) of (x - x_hat)^2
+    Shape: x, x_hat = (B, C, T)
+    Returns scalar.
+    """
+    sq_err = (x - x_hat) ** 2             # (B, C, T)
+    sq_err = _apply_mask(sq_err, mask)
+    return sq_err.mean()
+
+
+# ---------------------------------------------------------------------------
+# 2. Pattern Loss  (Equation 13)
+# ---------------------------------------------------------------------------
+def _pattern_loss(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Counts direction mismatches between consecutive timesteps.
+    L_pattern = mismatch_count / (T-1)
+
+    x, x_hat : (B, C, T)
+    Returns scalar.
+    """
+    # Temporal gradients (B, C, T-1)
+    grad_x     = x[..., 1:] - x[..., :-1]
+    grad_x_hat = x_hat[..., 1:] - x_hat[..., :-1]
+
+    # Signs  (-1, 0, +1)
+    sign_x     = torch.sign(grad_x)
+    sign_x_hat = torch.sign(grad_x_hat)
+
+    # Mismatch: |sign_x - sign_x_hat| / 2  gives 0 or 1
+    mismatch = (sign_x - sign_x_hat).abs()   # values in {0, 1, 2}
+
+    # Optional mask: apply to T-1 dimension
+    if mask is not None:
+        # mask is (B, T); take all but last timestep → (B, T-1)
+        w = torch.ones(mask.shape[0], mask.shape[1] - 1,
+                       dtype=mismatch.dtype, device=mismatch.device)
+        w[mask[:, :-1]] = 0.5
+        mismatch = mismatch * w.unsqueeze(1)
+
+    T = x.shape[-1]
+    return mismatch.mean() / 2.0           # normalise to [0,1]
+
+
+# ---------------------------------------------------------------------------
+# 3. Trend Loss  (Equation 14)
+# ---------------------------------------------------------------------------
+def _trend_loss(
+    x: torch.Tensor,
+    x_hat: torch.Tensor,
+    trend_window: int = 20,
+    step_size:    int = 10,
+) -> torch.Tensor:
+    """
+    Computes linear slopes in sliding windows and penalises slope differences.
+
+    x, x_hat : (B, C, T)
+    Returns scalar.
+    """
+    B, C, T = x.shape
+    W = trend_window
+
+    # Time indices (shared across batches/channels)
+    t_idx   = torch.arange(W, dtype=x.dtype, device=x.device)  # (W,)
+    t_mean  = t_idx.mean()                                      # scalar
+    t_dev   = t_idx - t_mean                                    # (W,)
+    denom   = (t_dev ** 2).sum()                                # scalar
+
+    slopes_x     = []
+    slopes_x_hat = []
+
+    starts = range(0, T - W + 1, step_size)
+    for start in starts:
+        seg_x     = x[..., start: start + W]        # (B, C, W)
+        seg_x_hat = x_hat[..., start: start + W]    # (B, C, W)
+
+        # Slope  m = sum((t - t_mean)(y - y_mean)) / sum((t - t_mean)^2)
+        y_mean_x     = seg_x.mean(dim=-1, keepdim=True)         # (B, C, 1)
+        y_mean_x_hat = seg_x_hat.mean(dim=-1, keepdim=True)
+
+        num_x     = ((t_dev * (seg_x     - y_mean_x)).sum(dim=-1))     # (B,C)
+        num_x_hat = ((t_dev * (seg_x_hat - y_mean_x_hat)).sum(dim=-1))
+
+        slopes_x.append(num_x / denom)
+        slopes_x_hat.append(num_x_hat / denom)
+
+    if not slopes_x:
+        return torch.tensor(0.0, device=x.device)
+
+    slopes_x     = torch.stack(slopes_x, dim=-1)      # (B, C, n_windows)
+    slopes_x_hat = torch.stack(slopes_x_hat, dim=-1)
+
+    return (slopes_x - slopes_x_hat).abs().mean()
+
+
+# ---------------------------------------------------------------------------
+# 4. Full CPLoss  (Algorithm 2 – Equation 12)
+# ---------------------------------------------------------------------------
+class CPLoss(nn.Module):
+    """
+    Clinical Pattern Loss — full version.
+
+    Parameters
+    ----------
+    lambda_fidelity : float  Weight for fidelity term.  Default 0.3
+    lambda_pattern  : float  Weight for pattern  term.  Default 0.3
+    lambda_trend    : float  Weight for trend    term.  Default 0.4
+    pattern_min/max : float  Min-max from training set (Algorithm 2 defaults).
+    trend_min/max   : float
+    fidelity_min/max: float
+    """
+
+    def __init__(
+        self,
+        lambda_fidelity: float = 0.3,
+        lambda_pattern:  float = 0.3,
+        lambda_trend:    float = 0.4,
+        # Normalisation constants from Algorithm 2
+        pattern_min:     float = 0.0404,
+        pattern_max:     float = 1.5859,
+        trend_min:       float = 0.000018451,
+        trend_max:       float = 0.00083290,
+        fidelity_min:    float = 0.00000013287,
+        fidelity_max:    float = 0.00015482,
+    ):
+        super().__init__()
+        self.lf = lambda_fidelity
+        self.lp = lambda_pattern
+        self.lt = lambda_trend
+
+        # Normalisation bounds
+        self.pat_min  = pattern_min;   self.pat_max  = pattern_max
+        self.tre_min  = trend_min;     self.tre_max  = trend_max
+        self.fid_min  = fidelity_min;  self.fid_max  = fidelity_max
+
+    # Utility: safe min-max normalisation (avoids divide-by-zero)
+    @staticmethod
+    def _norm(val: torch.Tensor, vmin: float, vmax: float) -> torch.Tensor:
+        rng = vmax - vmin
+        if rng < 1e-12:
+            return val * 0.0
+        return (val - vmin) / rng
+
+    def forward(
+        self,
+        x:    torch.Tensor,
+        x_hat: torch.Tensor,
+        mask:  torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        x, x_hat : (B, C, T)
+        mask      : (B, T) bool  — True = interpolated point
+        Returns scalar loss.
+        """
+        L_fid  = _fidelity_loss(x, x_hat, mask)
+        L_pat  = _pattern_loss(x, x_hat, mask)
+        L_tre  = _trend_loss(x, x_hat)
+
+        L_fid_n = self._norm(L_fid, self.fid_min, self.fid_max)
+        L_pat_n = self._norm(L_pat, self.pat_min,  self.pat_max)
+        L_tre_n = self._norm(L_tre, self.tre_min,  self.tre_max)
+
+        return self.lf * L_fid_n + self.lp * L_pat_n + self.lt * L_tre_n
+
+
+# ---------------------------------------------------------------------------
+# 5. Ablation variants (Table IV)
+# ---------------------------------------------------------------------------
+
+class MSEOnlyLoss(nn.Module):
+    """Ablation variant 1 — plain MSE, no clinical components."""
+
+    def forward(
+        self,
+        x:    torch.Tensor,
+        x_hat: torch.Tensor,
+        mask:  torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return _fidelity_loss(x, x_hat, mask)
+
+
+class MSEPatternLoss(nn.Module):
+    """
+    Ablation variant 2 — MSE + Pattern Loss (equal weights 0.5 / 0.5).
+    No normalisation applied (raw values combined).
+    """
+
+    def forward(
+        self,
+        x:    torch.Tensor,
+        x_hat: torch.Tensor,
+        mask:  torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return 0.5 * _fidelity_loss(x, x_hat, mask) \
+             + 0.5 * _pattern_loss(x, x_hat, mask)
+
+
+class MSETrendLoss(nn.Module):
+    """
+    Ablation variant 3 — MSE + Trend Loss (equal weights 0.5 / 0.5).
+    No normalisation applied.
+    """
+
+    def forward(
+        self,
+        x:    torch.Tensor,
+        x_hat: torch.Tensor,
+        mask:  torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return 0.5 * _fidelity_loss(x, x_hat, mask) \
+             + 0.5 * _trend_loss(x, x_hat)
+
+
+# ---------------------------------------------------------------------------
+# Factory — handy for train.py ablation loop
+# ---------------------------------------------------------------------------
+LOSS_VARIANTS = {
+    "MSE only":    MSEOnlyLoss,
+    "MSE+Pattern": MSEPatternLoss,
+    "MSE+Trend":   MSETrendLoss,
+    "CPLoss Full": CPLoss,
+}
+
+
+def get_loss(name: str) -> nn.Module:
+    """Return a loss instance by ablation name."""
+    if name not in LOSS_VARIANTS:
+        raise ValueError(f"Unknown loss '{name}'. Choose from {list(LOSS_VARIANTS)}")
+    return LOSS_VARIANTS[name]()
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    B, C, T = 4, 3, 60
+    x     = torch.rand(B, C, T)
+    x_hat = torch.rand(B, C, T)
+    mask  = torch.zeros(B, T, dtype=torch.bool)
+    mask[:, 10:15] = True   # pretend some points are interpolated
+
+    for name, cls in LOSS_VARIANTS.items():
+        loss_val = cls()(x, x_hat, mask)
+        print(f"  {name:15s} → loss = {loss_val.item():.6f}")
+
+    print("✓ loss.py smoke-test passed.")
+</file>
+
+<file path="model.py">
+"""
+model.py
+Sprint 3 – Deliverable 1 : TAAE Model Architecture
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Temporal Attention AutoEncoder (TAAE)
+Implemented directly from Algorithm 1 (algorithm1_taae.txt)
+
+Architecture:
+    Input (B, C, T)
+        ↓
+    ENCODER  : 2 stacked Bidirectional LSTMs  (hidden 64 → 32)
+        ↓
+    ATTENTION: Additive attention → context vector
+        ↓
+    BOTTLENECK: Linear → LayerNorm  (latent dim = 16)
+        ↓
+    DECODER  : 2 stacked Bidirectional LSTMs  (hidden 32 → 64)
+        ↓
+    OUTPUT   : Linear + Sigmoid  → X_hat (B, C, T)
+
+Usage:
+    model = TAAE(n_channels=3, window_size=60)
+    x_hat, alpha = model(x)          # x : (B, C, T)
+"""
+
+import torch
+import torch.nn as nn
+
+
+class TAAE(nn.Module):
+    """
+    Temporal Attention AutoEncoder.
+
+    Parameters
+    ----------
+    n_channels  : int   Number of input channels (C). Default 3.
+    window_size : int   Number of timesteps (T). Default 60.
+    d_latent    : int   Latent bottleneck dimension. Default 16.
+    d_attn      : int   Attention projection dimension. Default 32.
+    dropout     : float Dropout rate after each BiLSTM block. Default 0.2.
+    """
+
+    def __init__(
+        self,
+        n_channels:  int   = 3,
+        window_size: int   = 60,
+        d_latent:    int   = 16,
+        d_attn:      int   = 32,
+        dropout:     float = 0.2,
+    ):
+        super().__init__()
+        self.n_channels  = n_channels
+        self.window_size = window_size
+        self.d_latent    = d_latent
+
+        # ----------------------------------------------------------------
+        # ENCODER
+        # BiLSTM-1 : input_size=C  → output_size=64*2=128  (bidirectional)
+        # BiLSTM-2 : input_size=128 → output_size=32*2=64
+        # ----------------------------------------------------------------
+        self.enc_lstm1 = nn.LSTM(
+            input_size=n_channels, hidden_size=64,
+            num_layers=1, batch_first=True, bidirectional=True
+        )
+        self.enc_drop1 = nn.Dropout(dropout)
+
+        self.enc_lstm2 = nn.LSTM(
+            input_size=128, hidden_size=32,
+            num_layers=1, batch_first=True, bidirectional=True
+        )
+        self.enc_drop2 = nn.Dropout(dropout)
+
+        # ----------------------------------------------------------------
+        # ATTENTION  (additive / Bahdanau style)
+        # h2[t] ∈ R^64  →  a[t] ∈ R^32  →  e[t] ∈ R
+        # ----------------------------------------------------------------
+        self.attn_W = nn.Linear(64, d_attn, bias=True)   # W_a
+        self.attn_v = nn.Linear(d_attn, 1, bias=False)   # v^T
+
+        # ----------------------------------------------------------------
+        # LATENT BOTTLENECK
+        # c ∈ R^64  →  z ∈ R^16  →  LayerNorm
+        # ----------------------------------------------------------------
+        self.bottleneck   = nn.Linear(64, d_latent)
+        self.layer_norm   = nn.LayerNorm(d_latent)
+
+        # ----------------------------------------------------------------
+        # DECODER PROJECTION
+        # z ∈ R^16  →  z_proj ∈ R^64  (then repeated T times)
+        # ----------------------------------------------------------------
+        self.dec_proj = nn.Linear(d_latent, 64)
+
+        # ----------------------------------------------------------------
+        # DECODER
+        # BiLSTM-3 : input_size=64  → output_size=32*2=64
+        # BiLSTM-4 : input_size=64  → output_size=64*2=128
+        # ----------------------------------------------------------------
+        self.dec_lstm3 = nn.LSTM(
+            input_size=64, hidden_size=32,
+            num_layers=1, batch_first=True, bidirectional=True
+        )
+        self.dec_drop3 = nn.Dropout(dropout)
+
+        self.dec_lstm4 = nn.LSTM(
+            input_size=64, hidden_size=64,
+            num_layers=1, batch_first=True, bidirectional=True
+        )
+        self.dec_drop4 = nn.Dropout(dropout)
+
+        # ----------------------------------------------------------------
+        # OUTPUT LAYER
+        # h4[t] ∈ R^128  →  x_hat[t] ∈ R^C
+        # ----------------------------------------------------------------
+        self.output_layer = nn.Linear(128, n_channels)
+
+        # Weight initialisation (Xavier / Glorot as per Algorithm 3)
+        self._init_weights()
+
+    # ------------------------------------------------------------------
+    # Weight initialisation
+    # ------------------------------------------------------------------
+    def _init_weights(self):
+        for name, param in self.named_parameters():
+            if "weight_ih" in name or "weight_hh" in name:
+                nn.init.xavier_uniform_(param.data)
+            elif "bias" in name:
+                nn.init.zeros_(param.data)
+            elif param.dim() >= 2:
+                nn.init.xavier_uniform_(param.data)
+
+    # ------------------------------------------------------------------
+    # Forward pass  (Algorithm 1)
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x: torch.Tensor,
+        interp_mask: torch.Tensor | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        x           : (B, C, T)  Input signal batch.
+        interp_mask : (B, T) bool tensor — True where sample is interpolated.
+                      Passed through but NOT used inside the model itself;
+                      the loss function uses it to down-weight those points.
+
+        Returns
+        -------
+        x_hat  : (B, C, T)  Reconstructed signal.
+        alpha  : (B, T)     Attention weights per timestep.
+        """
+        B, C, T = x.shape
+
+        # Transpose to (B, T, C) for LSTM  (batch_first=True)
+        h = x.permute(0, 2, 1)   # (B, T, C)
+
+        # ---- ENCODER ------------------------------------------------
+        h1, _ = self.enc_lstm1(h)          # (B, T, 128)
+        h1    = self.enc_drop1(h1)
+
+        h2, _ = self.enc_lstm2(h1)         # (B, T, 64)
+        h2    = self.enc_drop2(h2)
+
+        # ---- ATTENTION ----------------------------------------------
+        # a[t] = tanh(W_a * h2[t] + b_a)   → (B, T, d_attn)
+        a = torch.tanh(self.attn_W(h2))    # (B, T, 32)
+        # e[t] = v^T * a[t]                → (B, T, 1) → (B, T)
+        e = self.attn_v(a).squeeze(-1)     # (B, T)
+        # alpha = softmax(e)
+        alpha = torch.softmax(e, dim=-1)   # (B, T)
+
+        # context vector c = sum(alpha[t] * h2[t])  → (B, 64)
+        c = torch.bmm(alpha.unsqueeze(1), h2).squeeze(1)  # (B, 64)
+
+        # ---- BOTTLENECK ---------------------------------------------
+        z = self.bottleneck(c)             # (B, 16)
+        z = self.layer_norm(z)             # (B, 16)
+
+        # ---- DECODER ------------------------------------------------
+        # Project and repeat T times
+        z_proj = torch.relu(self.dec_proj(z))          # (B, 64)
+        z_proj = z_proj.unsqueeze(1).repeat(1, T, 1)   # (B, T, 64)
+
+        h3, _ = self.dec_lstm3(z_proj)     # (B, T, 64)
+        h3    = self.dec_drop3(h3)
+
+        h4, _ = self.dec_lstm4(h3)         # (B, T, 128)
+        h4    = self.dec_drop4(h4)
+
+        # ---- OUTPUT -------------------------------------------------
+        out   = torch.sigmoid(self.output_layer(h4))  # (B, T, C)
+        x_hat = out.permute(0, 2, 1)                  # (B, C, T)
+
+        return x_hat, alpha
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke-test
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    B, C, T = 4, 3, 60
+    model = TAAE(n_channels=C, window_size=T)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"TAAE | params: {total_params:,}")
+
+    x     = torch.randn(B, C, T)
+    x_hat, alpha = model(x)
+
+    print(f"Input  shape : {x.shape}")
+    print(f"Output shape : {x_hat.shape}")
+    print(f"Alpha  shape : {alpha.shape}")
+    assert x_hat.shape == x.shape,      "x_hat shape mismatch"
+    assert alpha.shape == (B, T),       "alpha shape mismatch"
+    assert torch.allclose(alpha.sum(dim=-1), torch.ones(B), atol=1e-5), \
+        "attention weights must sum to 1"
+
+    print("✓ model.py smoke-test passed.")
+</file>
+
+<file path="sprint3_output/a2_benchmark_results.csv">
+batch_size,db_epoch_s,npy_epoch_s,db_ms_per_batch,npy_ms_per_batch,db_samples_per_s,npy_samples_per_s,speedup_npy_over_db
+16,214.178,2.479,79.33,0.92,202.0,17428.0,86.4
+32,203.569,1.592,150.81,1.18,212.0,27132.0,127.87
+64,199.321,1.582,295.32,2.34,217.0,27306.0,125.99
+128,210.685,1.995,624.32,5.91,205.0,21652.0,105.61
+</file>
+
+<file path="sprint3_output/a2_benchmark_results.json">
+{
+  "config": {
+    "patient_ids": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "batch_sizes": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "n_runs": 1,
+    "npy_dir": "..\\Data-Wrangling\\etl_output\\npy"
+  },
+  "results": [
+    {
+      "batch_size": 16,
+      "db_epoch_s": 214.178,
+      "npy_epoch_s": 2.479,
+      "db_ms_per_batch": 79.33,
+      "npy_ms_per_batch": 0.92,
+      "db_samples_per_s": 202.0,
+      "npy_samples_per_s": 17428.0,
+      "speedup_npy_over_db": 86.4
+    },
+    {
+      "batch_size": 32,
+      "db_epoch_s": 203.569,
+      "npy_epoch_s": 1.592,
+      "db_ms_per_batch": 150.81,
+      "npy_ms_per_batch": 1.18,
+      "db_samples_per_s": 212.0,
+      "npy_samples_per_s": 27132.0,
+      "speedup_npy_over_db": 127.87
+    },
+    {
+      "batch_size": 64,
+      "db_epoch_s": 199.321,
+      "npy_epoch_s": 1.582,
+      "db_ms_per_batch": 295.32,
+      "npy_ms_per_batch": 2.34,
+      "db_samples_per_s": 217.0,
+      "npy_samples_per_s": 27306.0,
+      "speedup_npy_over_db": 125.99
+    },
+    {
+      "batch_size": 128,
+      "db_epoch_s": 210.685,
+      "npy_epoch_s": 1.995,
+      "db_ms_per_batch": 624.32,
+      "npy_ms_per_batch": 5.91,
+      "db_samples_per_s": 205.0,
+      "npy_samples_per_s": 21652.0,
+      "speedup_npy_over_db": 105.61
+    }
+  ]
+}
+</file>
+
+<file path="sprint3_output/table_I_baselines.csv">
+Algorithm,F1 (%),Precision (%),Recall (%),Individual Acc. (%)
+Supervised BiLSTM,1.55,0.78,92.13,100.0
+Feature K-Means,1.01,0.51,84.27,66.67
+TS-KMeans DTW,0.62,0.31,44.94,100.0
+</file>
+
+<file path="sprint3_output/table_I_metrics.csv">
+Algorithm,Window Loss Metric,Window Loss Threshold,Calibration Percentile,F1 (%),Precision (%),Recall (%),Individual Acc. (%),Optimal Subject Threshold (%),TP,FP,FN,TN,Left Channel FPR Healthy (%),Right Channel FPR Healthy (%),Channel FPR Population
+TAAE,MSE,0.4273563,85.0,2.25,1.14,59.55,100.0,5.0,53,4579,36,21249,17.86,18.07,test healthy windows (no fully healthy test subject found)
+</file>
+
+<file path="sprint3_output/table_II_reconstruction.csv">
+Split,Windows,Healthy Windows,Anomalous Windows,MAE,RMSE,Pearson Correlation,Cosine Similarity
+Training,120946,120552,394,0.39400209,0.60502856,0.81902545,0.68258195
+Validation,25917,25836,81,0.3872412,0.60163279,0.82544774,0.68686278
+Test-Healthy,25828,25828,0,0.39723961,0.60879339,0.80986878,0.67498544
+Test-Anomalous,89,0,89,0.64350841,0.94570244,0.58707124,0.60795926
+</file>
+
+<file path="sprint3_output/team3/db_pipeline_benchmark.py">
+"""
+db_pipeline_benchmark.py - Sprint 3 Team 3
+Measures TimescaleDB (time_bucket) vs raw NPY fetch latency in ms/batch.
+Output: sprint3_output/team3/output/
+"""
+
+import argparse, csv, json, logging, os, sys, time
+from pathlib import Path
+import numpy as np
+import psycopg2
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("db_benchmark")
+
+OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def get_dsn():
+    return (f"postgresql://{os.getenv('TSDB_USER','postgres')}:{os.getenv('TSDB_PASSWORD','postgres')}"
+            f"@{os.getenv('TSDB_HOST','localhost')}:{os.getenv('TSDB_PORT','5432')}"
+            f"/{os.getenv('TSDB_DB','m6_thermal_tsdb')}")
+
+def get_patient_ids(dsn, limit=None):
+    conn = psycopg2.connect(dsn)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT patient_id::text FROM subjects ORDER BY patient_id{f' LIMIT {limit}' if limit else ''}")
+        ids = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return ids
+
+def bench_tsdb(dsn, patient_ids, batch_size, n_runs=3):
+    query = """
+        SELECT w.window_id, w.patient_id, w.label,
+               time_bucket('60 seconds', tr.timestamp) AS bucket,
+               AVG(tr.left_temperature_norm), AVG(tr.right_temperature_norm)
+        FROM windows_tsdb w
+        JOIN thermal_readings tr
+          ON tr.patient_id = w.patient_id
+         AND tr.timestamp BETWEEN w.window_start AND w.window_end
+        WHERE w.patient_id = ANY(%s::smallint[])
+        GROUP BY w.window_id, w.patient_id, w.label, bucket
+        ORDER BY w.window_id LIMIT %s
+    """
+    times = []
+    conn = psycopg2.connect(dsn)
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        with conn.cursor() as cur:
+            cur.execute(query, (patient_ids, batch_size))
+            cur.fetchall()
+        times.append((time.perf_counter() - t0) * 1000)
+    conn.close()
+    return {"method": "TimescaleDB", "batch_size": batch_size,
+            "mean_ms": round(np.mean(times), 2), "std_ms": round(np.std(times), 2)}
+
+def bench_npy(npy_dir, patient_ids, batch_size, n_runs=3):
+    files = [npy_dir / f"patient_{str(p).zfill(2)}_windows.npy" for p in patient_ids if (npy_dir / f"patient_{str(p).zfill(2)}_windows.npy").exists()]
+    if not files:
+        log.error(f"No .npy files found in {npy_dir}")
+        sys.exit(1)
+    times = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        for f in files:
+            arr = np.load(f, mmap_mode="r")
+            idx = np.random.randint(0, max(1, len(arr) - batch_size))
+            arr[idx: idx + batch_size].copy()
+        times.append((time.perf_counter() - t0) * 1000)
+    return {"method": "NPY files", "batch_size": batch_size,
+            "mean_ms": round(np.mean(times), 2), "std_ms": round(np.std(times), 2)}
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--npy-dir", default=os.getenv("NPY_DIR"))
+    p.add_argument("--patients", type=int, default=None)
+    p.add_argument("--runs", type=int, default=3)
+    args = p.parse_args()
+
+    dsn        = get_dsn()
+    npy_dir    = Path(args.npy_dir)
+    patients   = get_patient_ids(dsn, args.patients)
+    batch_sizes = [16, 32, 64, 128]
+
+    tsdb_res, npy_res = [], []
+    for bs in batch_sizes:
+        log.info(f"Batch {bs}...")
+        tsdb_res.append(bench_tsdb(dsn, patients, bs, args.runs))
+        npy_res.append( bench_npy(npy_dir, patients, bs, args.runs))
+
+    print(f"\n{'Batch':>6} | {'TSDB ms':>10} | {'NPY ms':>10} | {'Speedup':>10}")
+    print("-" * 45)
+    for t, n in zip(tsdb_res, npy_res):
+        speedup = t["mean_ms"] / n["mean_ms"] if n["mean_ms"] else 0
+        print(f"{t['batch_size']:>6} | {t['mean_ms']:>10.2f} | {n['mean_ms']:>10.2f} | {speedup:>9.2f}x")
+
+    rows = [{"batch_size": t["batch_size"], "tsdb_mean_ms": t["mean_ms"],
+             "npy_mean_ms": n["mean_ms"],
+             "speedup": round(t["mean_ms"]/n["mean_ms"], 3) if n["mean_ms"] else None}
+            for t, n in zip(tsdb_res, npy_res)]
+
+    csv_path = OUTPUT_DIR / "db_pipeline_benchmark_results.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader(); writer.writerows(rows)
+
+    json_path = OUTPUT_DIR / "db_pipeline_benchmark_results.json"
+    with open(json_path, "w") as f:
+        json.dump({"tsdb": tsdb_res, "npy": npy_res}, f, indent=2)
+
+    log.info(f"Saved → {csv_path}, {json_path}")
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="sprint3_output/team3/output/db_pipeline_benchmark_results.csv">
+batch_size,tsdb_mean_ms,npy_mean_ms,speedup
+16,492.19,366.2,1.344
+32,1252.2,41.44,30.217
+64,3539.4,58.34,60.668
+128,2177.0,122.65,17.75
+</file>
+
+<file path="sprint3_output/team3/output/db_pipeline_benchmark_results.json">
+{
+  "tsdb": [
+    {
+      "method": "TimescaleDB",
+      "batch_size": 16,
+      "mean_ms": 492.19,
+      "std_ms": 84.43
+    },
+    {
+      "method": "TimescaleDB",
+      "batch_size": 32,
+      "mean_ms": 1252.2,
+      "std_ms": 708.67
+    },
+    {
+      "method": "TimescaleDB",
+      "batch_size": 64,
+      "mean_ms": 3539.4,
+      "std_ms": 3458.38
+    },
+    {
+      "method": "TimescaleDB",
+      "batch_size": 128,
+      "mean_ms": 2177.0,
+      "std_ms": 464.1
+    }
+  ],
+  "npy": [
+    {
+      "method": "NPY files",
+      "batch_size": 16,
+      "mean_ms": 366.2,
+      "std_ms": 464.95
+    },
+    {
+      "method": "NPY files",
+      "batch_size": 32,
+      "mean_ms": 41.44,
+      "std_ms": 1.43
+    },
+    {
+      "method": "NPY files",
+      "batch_size": 64,
+      "mean_ms": 58.34,
+      "std_ms": 5.33
+    },
+    {
+      "method": "NPY files",
+      "batch_size": 128,
+      "mean_ms": 122.65,
+      "std_ms": 63.27
+    }
+  ]
+}
+</file>
+
+<file path="sprint3_output/team3/output/robustness_results.csv">
+condition,f1,precision,recall
+clean,0.021,0.0107,0.5
+noisy_2sigma,0.0057,0.0028,1.0
+</file>
+
+<file path="sprint3_output/team3/output/robustness_results.json">
+{
+  "tau": 0.4278872311115265,
+  "sigma_original": [
+    0.9990049600601196,
+    0.9990600347518921,
+    0.09953150898218155
+  ],
+  "clean": {
+    "f1": 0.021,
+    "precision": 0.0107,
+    "recall": 0.5
+  },
+  "noisy_2sigma": {
+    "f1": 0.0057,
+    "precision": 0.0028,
+    "recall": 1.0
+  },
+  "f1_degradation_pct": 72.86
+}
+</file>
+
+<file path="sprint3_output/team3/Readme team3.md">
+# Sprint 3 — Team 3 | Topic M6 : Synthetic Thermal Time-Series
+**Team SG03 | Sub-team 3 — DB Benchmarks, Schema & Robustness**
+
+---
+
+## Files
+
+| File | What it does |
+|---|---|
+| `schema_postgres.sql` | Adds `attention_maps` table to PostgreSQL + sample dump |
+| `schema_timescaledb.sql` | Adds `attention_maps` hypertable to TimescaleDB |
+| `db_pipeline_benchmark.py` | Compares TimescaleDB fetch latency vs raw NPY files (ms/batch) |
+| `robustness_test.py` | Injects double-σ noise into test set, measures F1 degradation |
+
+---
+
+## Environment (.env)
+```
+# PostgreSQL
+PG_HOST=localhost
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=your_password
+PG_DB=m6_thermal
+
+# TimescaleDB
+TSDB_HOST=localhost
+TSDB_PORT=5432
+TSDB_USER=postgres
+TSDB_PASSWORD=your_password
+TSDB_DB=m6_thermal_tsdb
+
+# Sprint 2 data path (absolute recommended on Windows)
+NPY_DIR=../../Data-Wrangling/data/processed/npy
+```
+
+---
+
+## How to Run
+
+```bash
+# 1. Apply schema updates (run once)
+psql -U postgres -d m6_thermal      -f sprint3_output/team3/schema_postgres.sql
+psql -U postgres -d m6_thermal_tsdb -f sprint3_output/team3/schema_timescaledb.sql
+
+# 2. DB Pipeline Benchmark
+python sprint3_output/team3/db_pipeline_benchmark.py
+
+# 3. Robustness Test
+python sprint3_output/team3/robustness_test.py
+```
+
+Output files saved to `sprint3_output/team3/output/`
+
+---
+
+## Results
+
+### DB Pipeline Benchmark — TimescaleDB vs NPY Files
+
+| Batch size | TSDB ms/batch | NPY ms/batch | Speedup |
+|:---:|---:|---:|---:|
+| 16  | 492.19  | 366.20  | 0.74x |
+| 32  | 1252.20 | 41.44   | 0.03x |
+| 64  | 3539.40 | 58.34   | 0.02x |
+| 128 | 2177.00 | 122.65  | 0.06x |
+
+**Conclusion:** NPY files are significantly faster for sequential batch loading (up to 60× at batch 64). TimescaleDB adds query parsing overhead unsuitable for tight training loops. However, TimescaleDB remains superior for arbitrary range queries, aggregations, and multi-patient filtering — as shown in Sprint 2 benchmarks (31% faster ingestion, 6.3× compression ratio, 119 MB vs 735 MB).
+
+---
+
+### Robustness Test — Double-σ Noise Injection
+
+| Condition | F1 | Precision | Recall |
+|---|:---:|:---:|:---:|
+| Clean test set     | 0.0210 | 0.0107 | 0.5000 |
+| Noisy test set (2σ) | 0.0057 | 0.0028 | 1.0000 |
+
+| Metric | Value |
+|---|:---:|
+| Anomaly threshold τ | 0.4279 |
+| F1 degradation | **72.86%** |
+| σ_original (left, right, asymmetry) | 0.999, 0.999, 0.100 |
+
+**Interpretation:** Under double-σ noise, the model recall increases to 100% (more windows flagged as anomalous) but precision collapses, causing a 72.86% F1 degradation. This confirms the model is sensitive to additive Gaussian noise and that the 85th-percentile threshold needs recalibration under noisy conditions.
+
+---
+
+## Repo Structure
+
+```
+Data-Loader/
+├── sprint3_output/
+│   ├── team3/
+│   │   ├── schema_postgres.sql
+│   │   ├── schema_timescaledb.sql
+│   │   ├── db_pipeline_benchmark.py
+│   │   ├── robustness_test.py
+│   │   ├── README_team3.md
+│   │   └── output/
+│   │       ├── db_pipeline_benchmark_results.csv
+│   │       ├── db_pipeline_benchmark_results.json
+│   │       ├── robustness_results.csv
+│   │       └── robustness_results.json
+│   └── best_model.pt
+└── .env
+```
+</file>
+
+<file path="sprint3_output/team3/robustness_test.py">
+"""
+robustness_test.py - Sprint 3 Team 3
+Injects double-sigma noise into test set, measures F1 degradation.
+Output: sprint3_output/team3/output/
+"""
+
+import os
+import argparse, csv, json, logging, sys
+from pathlib import Path
+import numpy as np
+import torch
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("robustness")
+
+OUTPUT_DIR  = Path(__file__).parent / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CHANNEL_IDX = [2, 3, 4]   # left_norm, right_norm, asymmetry
+BATCH_SIZE  = 128
+
+def load_windows(npy_dir, patient_ids):
+    windows, labels = [], []
+    for pid in patient_ids:
+        npy  = npy_dir / f"{pid}_windows.npy"
+        meta = npy_dir / f"{pid}_windows_meta.csv"
+        if not npy.exists():
+            continue
+        arr = np.load(npy)[:, CHANNEL_IDX, :].astype(np.float32)
+        if meta.exists():
+            import csv as _csv
+            with open(meta) as f:
+                lbs = [int(r["label"]) for r in _csv.DictReader(f)]
+            lbs = np.array(lbs[:len(arr)])
+        else:
+            lbs = np.zeros(len(arr), dtype=int)
+        windows.append(arr); labels.append(lbs)
+    return np.concatenate(windows), np.concatenate(labels)
+
+def load_model(model_path):
+    from model import TAAE
+    model = TAAE(n_channels=3, window_size=60)
+    ckpt  = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+    return model.to(DEVICE).eval()
+
+def get_losses(model, windows):
+    losses = []
+    with torch.no_grad():
+        for i in range(0, len(windows), BATCH_SIZE):
+            x     = torch.tensor(windows[i:i+BATCH_SIZE]).to(DEVICE)
+            x_hat, _ = model(x)
+            losses.extend(((x - x_hat)**2).mean(dim=(1,2)).cpu().numpy())
+    return np.array(losses)
+
+def metrics(losses, labels, tau):
+    preds = (losses > tau).astype(int)
+    return {
+        "f1":        round(float(f1_score(labels,        preds, zero_division=0)), 4),
+        "precision": round(float(precision_score(labels, preds, zero_division=0)), 4),
+        "recall":    round(float(recall_score(labels,    preds, zero_division=0)), 4),
+    }
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model",   default="sprint3_output/best_model.pt")
+    p.add_argument("--npy-dir", default=os.getenv("NPY_DIR"))
+    p.add_argument("--patients", type=int, default=None)
+    p.add_argument("--seed",    type=int, default=42)
+    args = p.parse_args()
+    np.random.seed(args.seed); torch.manual_seed(args.seed)
+
+    npy_dir = Path(args.npy_dir or os.getenv("NPY_DIR"))
+    pids    = sorted(p.stem.replace("_windows","") for p in npy_dir.glob("patient_*_windows.npy"))
+    if args.patients: pids = pids[:args.patients]
+
+    log.info(f"Loading {len(pids)} patients...")
+    windows, labels = load_windows(npy_dir, pids)
+
+    # Split: last 20% = test, rest healthy = threshold calibration
+    n        = len(windows)
+    test_idx = np.arange(int(n * 0.8), n)
+    train_h  = np.where(labels[:int(n * 0.8)] == 0)[0]
+
+    test_w, test_l = windows[test_idx], labels[test_idx]
+    train_hw       = windows[train_h]
+
+    log.info(f"Test: {len(test_w)} windows ({test_l.sum()} anomalous)")
+
+    model = load_model(Path(args.model))
+
+    # Threshold τ = 85th percentile of healthy train losses
+    train_losses = get_losses(model, train_hw)
+    tau = float(np.percentile(train_losses, 85))
+    log.info(f"τ = {tau:.6f}")
+
+    # sigma per channel from healthy training windows
+    sigma = train_hw.std(axis=(0, 2))   # (C,)
+    log.info(f"σ_original = {sigma}")
+
+    # Clean test
+    clean_losses  = get_losses(model, test_w)
+    clean_m       = metrics(clean_losses, test_l, tau)
+
+    # Noisy test (2σ)
+    noise         = np.random.normal(0, 2*sigma[None,:,None], test_w.shape).astype(np.float32)
+    noisy_losses  = get_losses(model, test_w + noise)
+    noisy_m       = metrics(noisy_losses, test_l, tau)
+
+    deg = (clean_m["f1"] - noisy_m["f1"]) / max(clean_m["f1"], 1e-9) * 100
+
+    print(f"\n{'Metric':<12} {'Clean':>8} {'Noisy(2σ)':>10} {'Δ':>8}")
+    print("-" * 42)
+    for k in ["f1", "precision", "recall"]:
+        print(f"{k.upper():<12} {clean_m[k]:>8.4f} {noisy_m[k]:>10.4f} {noisy_m[k]-clean_m[k]:>+8.4f}")
+    print(f"\nF1 degradation: {deg:.2f}%")
+
+    csv_path = OUTPUT_DIR / "robustness_results.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, ["condition","f1","precision","recall"])
+        w.writeheader()
+        w.writerow({"condition":"clean",       **clean_m})
+        w.writerow({"condition":"noisy_2sigma", **noisy_m})
+
+    json_path = OUTPUT_DIR / "robustness_results.json"
+    with open(json_path, "w") as f:
+        json.dump({"tau": tau, "sigma_original": sigma.tolist(),
+                   "clean": clean_m, "noisy_2sigma": noisy_m,
+                   "f1_degradation_pct": round(deg, 2)}, f, indent=2)
+
+    log.info(f"Saved → {csv_path}, {json_path}")
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="sprint3_output/team3/schema_postgres.sql">
+-- schema_postgres.sql — Sprint 3 Team 3 | Topic M6 | Team SG03
+-- Run: psql -U postgres -d m6_thermal -f sprint3_output/team3/schema_postgres.sql
+
+CREATE TABLE IF NOT EXISTS attention_maps (
+    id          BIGSERIAL    PRIMARY KEY,
+    patient_id  SMALLINT     NOT NULL REFERENCES subjects(patient_id),
+    window_id   INTEGER      NOT NULL,
+    timestep    SMALLINT     NOT NULL,
+    attn_weight FLOAT        NOT NULL,
+    recon_error FLOAT,
+    created_at  TIMESTAMPTZ  DEFAULT NOW(),
+    FOREIGN KEY (patient_id, window_id) REFERENCES windows(patient_id, window_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attn_patient_window ON attention_maps (patient_id, window_id);
+CREATE INDEX IF NOT EXISTS idx_attn_timestep       ON attention_maps (patient_id, timestep);
+
+-- Sample dump (50 windows, 2 patients)
+INSERT INTO windows (window_id, patient_id, segment_id, window_index, window_start, window_end, label, anomaly_ratio, is_interpolated)
+SELECT i, 0, 0, i,
+    '2024-01-01'::timestamptz + (i * INTERVAL '30 seconds'),
+    '2024-01-01'::timestamptz + (i * INTERVAL '30 seconds') + INTERVAL '60 seconds',
+    0, 0.0, FALSE
+FROM generate_series(0, 24) i
+ON CONFLICT DO NOTHING;
+
+INSERT INTO windows (window_id, patient_id, segment_id, window_index, window_start, window_end, label, anomaly_ratio, is_interpolated)
+SELECT i, 1, 0, i,
+    '2024-01-01'::timestamptz + (i * INTERVAL '30 seconds'),
+    '2024-01-01'::timestamptz + (i * INTERVAL '30 seconds') + INTERVAL '60 seconds',
+    CASE WHEN i IN (3,8,14,19,23) THEN 1 ELSE 0 END,
+    CASE WHEN i IN (3,8,14,19,23) THEN 0.85 ELSE 0.0 END,
+    FALSE
+FROM generate_series(0, 24) i
+ON CONFLICT DO NOTHING;
+</file>
+
+<file path="sprint3_output/team3/schema_timescaledb.sql">
+-- schema_timescaledb.sql — Sprint 3 Team 3 | Topic M6 | Team SG03
+-- Run: psql -U postgres -d m6_thermal_tsdb -f sprint3_output/team3/schema_timescaledb.sql
+
+CREATE TABLE IF NOT EXISTS attention_maps (
+    ts          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    patient_id  SMALLINT     NOT NULL,
+    window_id   INTEGER      NOT NULL,
+    timestep    SMALLINT     NOT NULL,
+    attn_weight FLOAT        NOT NULL,
+    recon_error FLOAT,
+    FOREIGN KEY (patient_id, window_id) REFERENCES windows_tsdb(patient_id, window_id)
+);
+
+SELECT create_hypertable('attention_maps', 'ts',
+    chunk_time_interval => INTERVAL '30 days',
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_attn_tsdb_patient_window ON attention_maps (patient_id, window_id);
+</file>
+
+<file path="thermal_npy_dataset.py">
+"""
+thermal_npy_dataset.py
+
+Sprint 3 – Module de référence NPY
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Chargement des fenêtres depuis les fichiers .npy produits par l'ETL Sprint 2.
+Utilisé uniquement pour le benchmark DB vs NPY (benchmark_vs_npy()).
+
+Les fichiers attendus (produits par etl_pipeline.py) :
+  <npy_dir>/patient_XX_windows.npy          shape (N, 5, 60)
+  <npy_dir>/patient_XX_windows_meta.csv     colonnes : window_id, label, ...
+
+Canaux dans le .npy (ordre fixe, défini dans etl_pipeline.py) :
+  0 : left_temperature
+  1 : right_temperature
+  2 : left_temperature_norm
+  3 : right_temperature_norm
+  4 : temp_asymmetry
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+log = logging.getLogger("thermal_npy_dataset")
+
+# Mapping canal → index dans le .npy
+CHANNEL_INDEX = {
+    "left_temperature":       0,
+    "right_temperature":      1,
+    "left_temperature_norm":  2,
+    "right_temperature_norm": 3,
+    "temp_asymmetry":         4,
+}
+DEFAULT_CHANNELS = ["left_temperature_norm", "right_temperature_norm", "temp_asymmetry"]
+DEFAULT_CHANNEL_INDICES = [CHANNEL_INDEX[c] for c in DEFAULT_CHANNELS]
+
+
+class ThermalNPYDataset(Dataset):
+    """
+    Dataset PyTorch basé sur les fichiers .npy (référence offline).
+
+    Paramètres
+    ----------
+    npy_dir : Path
+        Répertoire contenant patient_XX_windows.npy et patient_XX_windows_meta.csv.
+    patient_ids : list[int]
+        Patients à inclure.
+    channels : list[str]
+        Canaux à extraire (sous-ensemble de CHANNEL_INDEX).
+    """
+
+    def __init__(
+        self,
+        npy_dir: Path,
+        patient_ids: List[int],
+        channels: List[str] = DEFAULT_CHANNELS,
+    ):
+        self.npy_dir     = Path(npy_dir)
+        self.patient_ids = patient_ids
+        self.channels    = channels
+        self.ch_indices  = [CHANNEL_INDEX[c] for c in channels]
+
+        self._signals: np.ndarray  # (N_total, len(channels), 60)
+        self._labels:  np.ndarray  # (N_total,)
+        self._signals, self._labels = self._load_all()
+
+        log.info(
+            f"ThermalNPYDataset | patients={patient_ids} | "
+            f"fenêtres={len(self._labels)} | canaux={channels}"
+        )
+
+    def _load_all(self) -> Tuple[np.ndarray, np.ndarray]:
+        all_signals = []
+        all_labels  = []
+
+        for pid in self.patient_ids:
+            npy_path  = self.npy_dir / f"patient_{pid:02d}_windows.npy"
+            meta_path = self.npy_dir / f"patient_{pid:02d}_windows_meta.csv"
+
+            if not npy_path.exists():
+                log.warning(f"Fichier manquant : {npy_path}")
+                continue
+
+            arr  = np.load(npy_path)              # (N, 5, 60)
+            meta = pd.read_csv(meta_path)
+
+            # Sélection des canaux voulus
+            arr = arr[:, self.ch_indices, :]      # (N, C, 60)
+
+            all_signals.append(arr)
+            all_labels.append(meta["label"].values)
+
+        if not all_signals:
+            raise RuntimeError(
+                f"Aucun fichier .npy trouvé dans {self.npy_dir} "
+                f"pour les patients {self.patient_ids}."
+            )
+
+        return (
+            np.concatenate(all_signals, axis=0).astype(np.float32),
+            np.concatenate(all_labels,  axis=0).astype(np.int64),
+        )
+
+    def __len__(self) -> int:
+        return len(self._labels)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        signal = torch.from_numpy(self._signals[idx])      # (C, T)
+        label  = torch.tensor(self._labels[idx], dtype=torch.long)
+        return signal, label
+</file>
+
+<file path=".gitignore">
+# Environment variables
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python build files
+build/
+dist/
+*.egg-info/
+
+# Pytest
+.pytest_cache/
+
+# Mypy
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+</file>
+
+<file path="extract_attention_a3.py">
+import torch
+import logging
+import os
+from thermal_tsdb_dataset import ThermalTSDBDataset, ThermalTSDBDataModule
+from model import TAAE                          # ← TAAE, pas AnomalyTransformer
+from attention_store import AttentionStore
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("A3")
+
+# 1. Charger le modèle
+model = TAAE(n_channels=3, window_size=60)      # ← TAAE
+model_path = "sprint3_output/best_model.pt"
+
+if os.path.exists(model_path):
+    try:
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        log.info(f"Loaded weights from {model_path}")
+    except Exception as e:
+        log.error(f"Failed to load weights: {e}. Using random weights.")
+else:
+    log.warning(f"Model file {model_path} not found. Using random weights.")
+
+model.eval()
+
+# 2. Connexion DB
+store = AttentionStore()
+
+# 3. Dataset test
+dm = ThermalTSDBDataModule(batch_size=1)
+train_ids, val_ids, test_ids = dm.split()
+dataset = ThermalTSDBDataset(dsn=dm.dsn, patient_ids=test_ids)
+
+# 4. Inférence + stockage
+log.info(f"Running inference on {min(50, len(dataset))} windows...")
+for i in range(min(50, len(dataset))):
+    try:
+        sample = dataset.get_sample_with_meta(i)
+        x = sample["signal"].unsqueeze(0)          # (1, C, T)
+
+        with torch.no_grad():
+            _, alpha = model(x)                    # TAAE retourne (x_hat, alpha)
+            weights = alpha[0].cpu().numpy()       # (T,)
+
+        store.insert(
+            window_id  = sample["window_id"],
+            patient_id = sample["patient_id"],
+            timestamps = sample["timestamps"],
+            weights    = weights,
+            epoch      = 0
+        )
+
+        if (i + 1) % 10 == 0:
+            log.info(f"  Processed {i+1} windows...")
+
+    except Exception as e:
+        log.error(f"Error processing window {i}: {e}")
+        continue
+
+print(f"\nA3 DONE: Attention maps stored in DB")
+print(f"Total rows in attention_maps: {store.count()}")
+</file>
+
+<file path="README.md">
+# Data-Loader Guide (Sprint 3)
+**Topic M6 : Synthetic Thermal Time-Series | Team SG03**
+
+This module handles direct TimescaleDB-to-Model data loading for PyTorch.
+
+## 1. Prerequisites
+
+- **Python 3.8+**
+- **TimescaleDB** instance running with the following tables (populated in Sprint 2):
+  - `subjects`: Patient metadata.
+  - `thermal_readings`: High-frequency sensor data.
+  - `windows_tsdb`: Pre-computed window segments and labels.
+- **Environment File**: A `.env` file in this directory with the following keys:
+  ```env
+  TSDB_HOST=localhost
+  TSDB_PORT=5433
+  TSDB_USER=postgres
+  TSDB_PASSWORD=postgres
+  TSDB_DB=m6_thermal_tsdb
+  ```
+
+## 2. Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## 3. Execution
+
+### A. Test Database Connection & DataLoader
+Verifies if the system can read windows directly from TimescaleDB.
+```bash
+python thermal_tsdb_dataset.py
+```
+
+### B. Train Anomaly Detection Model
+Trains the `AnomalyTransformer` model using data fetched from the DB.
+```bash
+python train_example.py --epochs 10 --batch-size 32
+```
+
+### C. Run Performance Benchmark (Task A2)
+Compares DB retrieval speed against local `.npy` files.
+```bash
+# Provide the path to the NPY directory from Sprint 2
+python benchmark_A2.py --npy-dir "../Data-Wrangling/etl_output/npy"
+```
+
+### D. Extract & Store Attention Maps (Task A3)
+Runs inference and stores (window_id, timestamp, weight) in the `attention_maps` table.
+```bash
+python extract_attention_a3.py
+```
+
+## 4. Key Files
+
+- `thermal_tsdb_dataset.py`: Core logic for TimescaleDB-to-PyTorch integration.
+- `train_example.py`: Full training loop implementation.
+- `attention_store.py`: Database schema and logic for storing attention weights.
+- `extract_attention_a3.py`: Script to generate and save attention maps after inference.
+- `benchmark_A2.py`: Performance comparison script.
+</file>
+
+<file path="READMEV2.md">
+# Sprint 3 — Topic M6 : Synthetic Thermal Time-Series
+**Team SG03 | Sub-team 1 — Model Architecture & Training**
+
+---
+
+## What We Did
+
+We built the anomaly detection system that learns what **normal skin temperature looks like**, then flags patients whose signals look different.
+
+The system reads data directly from **TimescaleDB** (no CSV files), trains a deep learning model on healthy patients only, and saves the best model for other teams to use.
+
+---
+
+## How It All Works Together
+
+```
+TimescaleDB
+    ↓
+thermal_tsdb_dataset.py   ← pulls windows from DB, feeds the model
+    ↓
+train.py                  ← runs the training loop
+    ↓  uses ↓
+model.py                  ← the brain (TAAE architecture)
+loss.py                   ← grades how wrong the model was
+    ↓
+sprint3_output/
+    ├── best_model.pt     ← saved best model (use this for evaluation)
+    ├── figure1.png       ← training curves
+    ├── table_IV_ablation.csv
+    ↓
+evaluate.py               ← runs evaluation on test set
+    ↓
+    ├── table_I_metrics.csv           ← anomaly detection metrics
+    └── table_II_reconstruction.csv   ← reconstruction quality metrics
+```
+
+---
+
+## Files
+
+### 🆕 Written this Sprint (Team 1)
+
+| File | What it does |
+|---|---|
+| `model.py` | The TAAE model — encoder, attention, decoder. Import this to load the model. |
+| `loss.py` | 4 loss variants: MSE only, MSE+Pattern, MSE+Trend, CPLoss Full. Used during training. |
+| `train.py` | Runs training, saves best checkpoint, generates Figure 1 and Table IV. |
+| `evaluate.py` | Evaluates the trained model on test set. Computes anomaly detection metrics and reconstruction quality. Outputs Table I and Table II. |
+
+### ✅ Built in Previous Tasks (A1 / A2 / A3)
+
+| File | What it does | Task |
+|---|---|---|
+| `thermal_tsdb_dataset.py` | Connects TimescaleDB to PyTorch. Feeds windows to the model during training. | A1 |
+| `thermal_npy_dataset.py` | Same but reads from .npy files. Used only for the speed benchmark. | A1 |
+| `benchmark_A2.py` | Compares DB vs NPY loading speed. Result: NPY is ~110× faster. | A2 |
+| `attention_store.py` | Saves attention weights to DB after inference. | A3 |
+| `extract_attention_a3.py` | Runs the model on test patients and stores attention maps in DB. | A3 |
+| `train_example.py` | Old training script (replaced by train.py — kept for reference). | — |
+
+---
+
+## How to Run
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Train the model (default: CPLoss Full)
+python train.py
+
+# Run all 4 ablation variants → Table IV
+python train.py --ablation
+
+# Evaluate the trained model → Table I (anomaly metrics) & Table II (reconstruction quality)
+python evaluate.py --npy-dir ../Data-Wrangling/etl_output/npy
+
+# Store attention maps in DB (after training)
+python extract_attention_a3.py
+```
+
+---
+
+## Evaluation Outputs
+
+**Table I — Anomaly Detection Metrics** (`table_I_metrics.csv`)
+- F1, Precision, Recall scores for anomaly detection
+- Individual patient accuracy
+- Window/subject anomaly thresholds
+- Per-channel false positive rates on healthy subjects
+- Confusion matrix (TP, FP, FN, TN)
+
+**Table II — Reconstruction Quality** (`table_II_reconstruction.csv`)
+- MAE, RMSE, Pearson correlation, Cosine similarity
+- Computed separately for:
+  - Training set (all windows)
+  - Validation set (all windows)
+  - Test healthy windows only
+  - Test anomalous windows only
+
+---
+
+## For Other Teams
+
+**Team 2 (Evaluation):**
+- Load the model: `from model import TAAE`
+- Load weights: `model.load_state_dict(torch.load("sprint3_output/best_model.pt"))`
+- Anomaly threshold: 85th percentile of healthy training losses
+
+**Team 3 (Explainability):**
+- Attention maps are stored in the `attention_maps` table in TimescaleDB
+- Query high-attention windows per patient using `attention_store.py`
+
+---
+
+## Environment (.env)
+```
+TSDB_HOST=localhost
+TSDB_PORT=5433
+TSDB_USER=postgres
+TSDB_PASSWORD=postgres
+TSDB_DB=m6_thermal_tsdb
+```
+</file>
+
+<file path="requirements.txt">
+colorama==0.4.6
+filelock==3.29.0
+fsspec==2026.4.0
+Jinja2==3.1.6
+joblib==1.5.3
+MarkupSafe==3.0.3
+mpmath==1.3.0
+networkx==3.6.1
+numpy==2.4.6
+pandas==3.0.3
+psycopg2-binary==2.9.12
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+scikit-learn==1.8.0
+scipy==1.17.1
+setuptools==81.0.0
+six==1.17.0
+sympy==1.14.0
+threadpoolctl==3.6.0
+torch==2.12.0
+tqdm==4.67.3
+typing_extensions==4.15.0
+tzdata==2026.2
+</file>
+
+<file path="train_example.py">
+"""
+train_example.py
+
+Sprint 3 – Exemple d'entraînement complet
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Démontre comment utiliser ThermalTSDBDataModule avec un modèle d'attention
+(Transformer simplifié) pour la détection d'anomalies thermiques.
+
+Usage
+-----
+  python train_example.py --epochs 10 --batch-size 64 --num-workers 4
+
+Le script :
+  1. Initialise le DataModule (connexion TimescaleDB)
+  2. Crée les DataLoaders train / val / test
+  3. Définit un AnomalyTransformer simple
+  4. Lance la boucle d'entraînement avec mesure de latence DB
+  5. Exporte un rapport JSON (metrics + timing)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from dotenv import load_dotenv
+
+from thermal_tsdb_dataset import ThermalTSDBDataModule, _build_dsn_from_env
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("train")
+
+# ---------------------------------------------------------------------------
+# Modèle : AnomalyTransformer (attention-based, léger)
+# ---------------------------------------------------------------------------
+
+class AnomalyTransformer(nn.Module):
+    """
+    Transformateur léger pour classification d'anomalies sur séries temporelles.
+
+    Architecture
+    ------------
+    Input  : (B, C, T)   →  C canaux, T pas de temps
+    Embed  : projection linéaire (C, T) → (T, d_model)
+    Encode : N couches TransformerEncoder (self-attention multi-tête)
+    Pool   : mean pooling sur la dimension temporelle
+    Head   : MLP → 2 classes (normal / anomalie)
+
+    Les cartes d'attention (attn_weights) sont stockées pour l'analyse
+    d'explicabilité (Sprint 3 T8).
+    """
+
+    def __init__(
+        self,
+        n_channels: int   = 3,
+        window_size: int  = 60,
+        d_model: int      = 64,
+        nhead: int        = 4,
+        num_layers: int   = 2,
+        dropout: float    = 0.1,
+        n_classes: int    = 2,
+    ):
+        super().__init__()
+        self.n_channels  = n_channels
+        self.window_size = window_size
+        self.d_model     = d_model
+
+        # Projection des canaux vers d_model
+        self.input_proj = nn.Linear(n_channels, d_model)
+
+        # Encodage positionnel
+        self.pos_enc = nn.Embedding(window_size, d_model)
+
+        # Transformer Encoder
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model         = d_model,
+            nhead           = nhead,
+            dim_feedforward = d_model * 4,
+            dropout         = dropout,
+            batch_first     = True,   # (B, T, d_model)
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        # Tête de classification
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, n_classes),
+        )
+
+        # Poids d'attention pour l'explicabilité (remplis lors du forward)
+        self.last_attention_weights: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, C, T)
+        returns : (B, n_classes)  logits
+        """
+        B, C, T = x.shape
+
+        # (B, C, T) → (B, T, C) → (B, T, d_model)
+        x = x.permute(0, 2, 1)           # (B, T, C)
+        x = self.input_proj(x)           # (B, T, d_model)
+
+        # Encodage positionnel
+        positions = torch.arange(T, device=x.device)
+        x = x + self.pos_enc(positions)  # (B, T, d_model)
+
+        # Encodeur Transformer
+        x = self.encoder(x)              # (B, T, d_model)
+
+        # Pooling temporel (mean)
+        x = x.mean(dim=1)               # (B, d_model)
+
+        return self.classifier(x)        # (B, n_classes)
+
+    def get_attention_maps(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Calcule les cartes d'attention pour une fenêtre.
+        Utilisé en Sprint 3 T8 (Explainability).
+
+        Retourne : (n_layers, n_heads, T, T)
+        """
+        self.eval()
+        attention_maps = []
+
+        B, C, T = x.shape
+        x = x.permute(0, 2, 1)
+        x = self.input_proj(x)
+        positions = torch.arange(T, device=x.device)
+        x = x + self.pos_enc(positions)
+
+        for layer in self.encoder.layers:
+            # Accès aux poids d'attention de la couche
+            with torch.no_grad():
+                attn_output, attn_weights = layer.self_attn(
+                    x, x, x, need_weights=True, average_attn_weights=False
+                )
+            attention_maps.append(attn_weights.detach())  # (B, n_heads, T, T)
+            x = layer(x)
+
+        # Stack : (n_layers, B, n_heads, T, T) → squeeze B si B=1
+        return torch.stack(attention_maps, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Métriques
+# ---------------------------------------------------------------------------
+
+def compute_metrics(logits: torch.Tensor, labels: torch.Tensor) -> dict:
+    """Calcule accuracy, precision, recall, F1 pour la classe anomalie."""
+    preds = logits.argmax(dim=1)
+    tp = ((preds == 1) & (labels == 1)).sum().float()
+    fp = ((preds == 1) & (labels == 0)).sum().float()
+    fn = ((preds == 0) & (labels == 1)).sum().float()
+    tn = ((preds == 0) & (labels == 0)).sum().float()
+
+    acc       = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+
+    return {
+        "accuracy":  acc.item(),
+        "precision": precision.item(),
+        "recall":    recall.item(),
+        "f1":        f1.item(),
+        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Boucle d'entraînement
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(
+    model:     nn.Module,
+    loader:    torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device:    torch.device,
+) -> dict:
+    """Entraîne le modèle sur une époque. Retourne les métriques + timing."""
+    model.train()
+    total_loss = 0.0
+    all_logits = []
+    all_labels = []
+    data_fetch_time = 0.0
+    compute_time    = 0.0
+
+    t_start = time.perf_counter()
+    t_fetch = time.perf_counter()
+
+    for signals, labels in loader:
+        # Mesure du temps de lecture DB
+        data_fetch_time += time.perf_counter() - t_fetch
+
+        # Transfert GPU
+        t_compute = time.perf_counter()
+        signals = signals.to(device)    # (B, C, T)
+        labels  = labels.to(device)
+
+        optimizer.zero_grad()
+        logits = model(signals)         # (B, 2)
+        loss   = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.cpu())
+
+        compute_time += time.perf_counter() - t_compute
+        t_fetch = time.perf_counter()   # Reset chrono fetch
+
+    epoch_time = time.perf_counter() - t_start
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
+    metrics    = compute_metrics(all_logits, all_labels)
+    metrics.update({
+        "loss":              total_loss / len(loader),
+        "epoch_s":           round(epoch_time, 3),
+        "data_fetch_s":      round(data_fetch_time, 3),
+        "compute_s":         round(compute_time, 3),
+        "db_overhead_pct":   round(100 * data_fetch_time / epoch_time, 1),
+        "samples_per_s":     round(len(all_labels) / epoch_time, 0),
+    })
+    return metrics
+
+
+@torch.no_grad()
+def evaluate(
+    model:    nn.Module,
+    loader:   torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device:   torch.device,
+) -> dict:
+    """Évalue le modèle sur val ou test."""
+    model.eval()
+    total_loss = 0.0
+    all_logits = []
+    all_labels = []
+
+    for signals, labels in loader:
+        signals = signals.to(device)
+        labels  = labels.to(device)
+        logits  = model(signals)
+        loss    = criterion(logits, labels)
+        total_loss += loss.item()
+        all_logits.append(logits.cpu())
+        all_labels.append(labels.cpu())
+
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
+    metrics    = compute_metrics(all_logits, all_labels)
+    metrics["loss"] = total_loss / len(loader)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Sprint 3 – Training Loop TimescaleDB")
+    p.add_argument("--dsn",         default=None)
+    p.add_argument("--epochs",      type=int,   default=10)
+    p.add_argument("--batch-size",  type=int,   default=32)
+    p.add_argument("--num-workers", type=int,   default=0)
+    p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--d-model",     type=int,   default=64)
+    p.add_argument("--n-layers",    type=int,   default=2)
+    p.add_argument("--out-dir",     default="sprint3_output")
+    return p.parse_args()
+
+
+def main():
+    args   = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device : {device}")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. DataModule ────────────────────────────────────────────────
+    dsn = args.dsn or _build_dsn_from_env()
+    dm  = ThermalTSDBDataModule(
+        dsn         = dsn,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+    )
+    train_loader, val_loader, test_loader = dm.get_loaders()
+
+    # Inférer les dimensions depuis un batch
+    sample_signals, _ = next(iter(train_loader))
+    _, n_channels, window_size = sample_signals.shape
+    log.info(f"Shape signal : (B={args.batch_size}, C={n_channels}, T={window_size})")
+
+    # ── 2. Modèle ────────────────────────────────────────────────────
+    model = AnomalyTransformer(
+        n_channels  = n_channels,
+        window_size = window_size,
+        d_model     = args.d_model,
+        num_layers  = args.n_layers,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"Paramètres entraînables : {n_params:,}")
+
+    # Classe pondérée pour corriger le déséquilibre (85% normal, 15% anomalie)
+    class_weights = torch.tensor([0.15, 0.85], dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # ── 3. Boucle d'entraînement ─────────────────────────────────────
+    history = []
+    best_val_f1 = 0.0
+    best_model_path = out_dir / "best_model.pt"
+
+    log.info("=" * 60)
+    log.info("DÉBUT DE L'ENTRAÎNEMENT")
+    log.info("=" * 60)
+
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, criterion, device
+        )
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        record = {
+            "epoch": epoch,
+            "train": train_metrics,
+            "val":   val_metrics,
+        }
+        history.append(record)
+
+        log.info(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"Train loss={train_metrics['loss']:.4f} F1={train_metrics['f1']:.3f} "
+            f"[{train_metrics['epoch_s']:.1f}s, "
+            f"DB={train_metrics['db_overhead_pct']}%] | "
+            f"Val F1={val_metrics['f1']:.3f}"
+        )
+
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
+            torch.save(model.state_dict(), best_model_path)
+            log.info(f"  ✓ Meilleur modèle sauvegardé (val F1={best_val_f1:.3f})")
+
+    # ── 4. Évaluation finale sur le test set ─────────────────────────
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    log.info("=" * 60)
+    log.info("ÉVALUATION FINALE (Test Set)")
+    log.info(f"  Loss      : {test_metrics['loss']:.4f}")
+    log.info(f"  Accuracy  : {test_metrics['accuracy']:.3f}")
+    log.info(f"  Precision : {test_metrics['precision']:.3f}")
+    log.info(f"  Recall    : {test_metrics['recall']:.3f}")
+    log.info(f"  F1        : {test_metrics['f1']:.3f}")
+    log.info(f"  TP={test_metrics['tp']} FP={test_metrics['fp']} "
+             f"FN={test_metrics['fn']} TN={test_metrics['tn']}")
+    log.info("=" * 60)
+
+    # ── 5. Export du rapport ─────────────────────────────────────────
+    report = {
+        "config": {
+            "epochs":      args.epochs,
+            "batch_size":  args.batch_size,
+            "num_workers": args.num_workers,
+            "lr":          args.lr,
+            "d_model":     args.d_model,
+            "n_layers":    args.n_layers,
+            "n_params":    n_params,
+            "device":      str(device),
+        },
+        "test_metrics": test_metrics,
+        "history":      history,
+    }
+    report_path = out_dir / "training_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    log.info(f"Rapport sauvegardé → {report_path}")
+
+    # Résumé timing DB overhead
+    avg_db_pct = np.mean([e["train"]["db_overhead_pct"] for e in history])
+    avg_samples_s = np.mean([e["train"]["samples_per_s"] for e in history])
+    log.info(f"\nRésumé timing DataLoader DB :")
+    log.info(f"  Overhead DB moyen par époque : {avg_db_pct:.1f}%")
+    log.info(f"  Débit moyen                  : {avg_samples_s:.0f} samples/s")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="train.py">
+"""
+train.py
+Sprint 3 – Deliverable 3 : Training Script
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Implements Algorithm 3 (algorithm3_training.txt) exactly:
+  • AdamW optimiser  (lr=0.001, weight_decay=0.0001)
+  • ReduceLROnPlateau scheduler  (patience=5, factor=0.5)
+  • Early stopping  (patience=50)
+  • Xavier weight initialisation  (done inside model.py)
+  • Saves best checkpoint to sprint3_output/best_model.pt
+
+Report outputs (auto-generated after training):
+  • Figure 1 left  : Training + Validation loss curves (log scale)
+  • Figure 1 right : Learning-rate schedule
+  • Table IV CSV   : Ablation study results
+
+Usage
+-----
+    # Single run with CPLoss (default)
+    python train.py
+
+    # Full ablation study (all 4 loss variants → Table IV)
+    python train.py --ablation
+
+    # Custom settings
+    python train.py --epochs 500 --batch-size 64 --loss "MSE only"
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from dotenv import load_dotenv
+
+from model import TAAE
+from loss  import CPLoss, get_loss, LOSS_VARIANTS
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("train")
+
+# ---------------------------------------------------------------------------
+# Output directory
+# ---------------------------------------------------------------------------
+OUT_DIR = Path("sprint3_output")
+OUT_DIR.mkdir(exist_ok=True)
+
+
+# ===========================================================================
+# Core training function  (Algorithm 3)
+# ===========================================================================
+
+def train_model(
+    train_loader:  DataLoader,
+    val_loader:    DataLoader,
+    n_channels:    int   = 3,
+    window_size:   int   = 60,
+    max_epochs:    int   = 5,
+    learning_rate: float = 0.001,
+    weight_decay:  float = 0.0001,
+    patience:      int   = 50,
+    lr_patience:   int   = 5,
+    lr_factor:     float = 0.5,
+    loss_name:     str   = "CPLoss Full",
+    checkpoint_path: Path = OUT_DIR / "best_model.pt",
+    device:        Optional[torch.device] = None,
+) -> dict:
+    """
+    Train TAAE with the chosen loss variant.
+
+    Returns a history dict with keys:
+        train_losses, val_losses, lr_history, best_epoch, stopped_epoch
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Device : {device}")
+
+    # ---- Model & optimiser ------------------------------------------------
+    model     = TAAE(n_channels=n_channels, window_size=window_size).to(device)
+    criterion = get_loss(loss_name).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience
+    )
+
+    log.info(
+        f"Training | loss={loss_name} | epochs={max_epochs} "
+        f"| patience={patience} | lr={learning_rate}"
+    )
+
+    # ---- History buffers ---------------------------------------------------
+    train_losses: list[float] = []
+    val_losses:   list[float] = []
+    lr_history:   list[float] = []
+
+    best_val_loss    = float("inf")
+    patience_counter = 0
+    best_epoch       = 0
+    stopped_epoch    = max_epochs
+
+    # ---- Training loop  (Algorithm 3) -------------------------------------
+    for epoch in range(1, max_epochs + 1):
+
+        # ==================== TRAINING PHASE ====================
+        model.train()
+        total_train = 0.0
+        n_batches   = 0
+
+        for batch in train_loader:
+            # Unpack — loader may return (signal, label) or (signal, label, mask)
+            if len(batch) == 3:
+                signals, labels, masks = batch
+                masks = masks.to(device)
+            else:
+                signals, labels = batch
+                masks = None
+
+            # Only train on healthy windows (label == 0) as per Algorithm 3
+            healthy = (labels == 0)
+            if healthy.sum() == 0:
+                continue
+
+            signals = signals[healthy].to(device)   # (B, C, T)
+            if masks is not None:
+                masks = masks[healthy]
+
+            optimizer.zero_grad()
+            x_hat, alpha = model(signals)
+            loss = criterion(signals, x_hat, masks)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            total_train += loss.item()
+            n_batches   += 1
+
+        avg_train = total_train / max(n_batches, 1)
+
+        # ==================== VALIDATION PHASE ====================
+        model.eval()
+        total_val = 0.0
+        n_val_batches = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 3:
+                    signals, labels, masks = batch
+                    masks = masks.to(device)
+                else:
+                    signals, labels = batch
+                    masks = None
+
+                healthy = (labels == 0)
+                if healthy.sum() == 0:
+                    continue
+
+                signals = signals[healthy].to(device)
+                if masks is not None:
+                    masks = masks[healthy]
+
+                x_hat, _ = model(signals)
+                loss = criterion(signals, x_hat, masks)
+                total_val     += loss.item()
+                n_val_batches += 1
+
+        avg_val = total_val / max(n_val_batches, 1)
+
+        # ==================== LR SCHEDULER ====================
+        scheduler.step(avg_val)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # ==================== RECORD HISTORY ====================
+        train_losses.append(avg_train)
+        val_losses.append(avg_val)
+        lr_history.append(current_lr)
+
+        # ==================== EARLY STOPPING ====================
+        if avg_val < best_val_loss:
+            best_val_loss    = avg_val
+            patience_counter = 0
+            best_epoch       = epoch
+            torch.save(model.state_dict(), checkpoint_path)
+        else:
+            patience_counter += 1
+
+        if epoch % 10 == 0:
+            log.info(
+                f"Epoch {epoch:4d} | "
+                f"Train={avg_train:.6f} | Val={avg_val:.6f} | "
+                f"LR={current_lr:.2e} | patience={patience_counter}/{patience}"
+            )
+
+        if patience_counter >= patience:
+            log.info(f"Early stopping at epoch {epoch} (best epoch {best_epoch})")
+            stopped_epoch = epoch
+            break
+
+    log.info(f"Best val loss : {best_val_loss:.6f} at epoch {best_epoch}")
+
+    return {
+        "loss_name":     loss_name,
+        "train_losses":  train_losses,
+        "val_losses":    val_losses,
+        "lr_history":    lr_history,
+        "best_epoch":    best_epoch,
+        "stopped_epoch": stopped_epoch,
+        "best_val_loss": best_val_loss,
+    }
+
+
+# ===========================================================================
+# Quick evaluation helpers (for Table IV)
+# ===========================================================================
+
+def evaluate_model(
+    model_path: Path,
+    test_loader: DataLoader,
+    n_channels:  int = 3,
+    window_size: int = 60,
+    threshold_pct: float = 85.0,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """
+    Computes Test MAE, F1, and Individual Accuracy from a saved checkpoint.
+    Returns a dict with keys: test_mae, f1, individual_acc.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = TAAE(n_channels=n_channels, window_size=window_size).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    all_losses   = []
+    all_labels   = []
+    all_maes     = []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            signals, labels = batch[0], batch[1]
+            signals = signals.to(device)
+            x_hat, _ = model(signals)
+
+            # Per-window reconstruction loss (MAE)
+            mae = (signals - x_hat).abs().mean(dim=(1, 2))   # (B,)
+            all_maes.extend(mae.cpu().tolist())
+            all_losses.extend(mae.cpu().tolist())
+            all_labels.extend(labels.tolist())
+
+    losses = np.array(all_losses)
+    labels = np.array(all_labels)
+
+    # Threshold = 85th percentile of normal losses
+    normal_losses = losses[labels == 0]
+    tau = np.percentile(normal_losses, threshold_pct) if len(normal_losses) > 0 else losses.mean()
+
+    preds = (losses > tau).astype(int)
+
+    # F1
+    tp = ((preds == 1) & (labels == 1)).sum()
+    fp = ((preds == 1) & (labels == 0)).sum()
+    fn = ((preds == 0) & (labels == 1)).sum()
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+    test_mae = float(np.mean(all_maes))
+
+    # Individual accuracy (simplified: window-level here)
+    individual_acc = float(100 * (preds == labels).mean())
+
+    return {
+        "test_mae":       round(test_mae * 1000, 4),   # ×10^-3 as per table
+        "f1":             round(float(f1) * 100, 2),
+        "individual_acc": round(individual_acc, 2),
+    }
+
+
+# ===========================================================================
+# Figure 1 — Training curves + LR schedule
+# ===========================================================================
+
+def plot_figure1(history: dict, save_path: Path = OUT_DIR / "figure1.png"):
+    """
+    Figure 1 (left)  : Training + Validation loss (log scale) with early-stop line.
+    Figure 1 (right) : Learning-rate schedule.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning("matplotlib not installed — skipping Figure 1")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Figure 1 — Training Curves", fontsize=13)
+
+    epochs     = range(1, len(history["train_losses"]) + 1)
+    best_epoch = history["best_epoch"]
+
+    # ---- Left : loss curves ------------------------------------------------
+    ax1.semilogy(epochs, history["train_losses"], color="blue",   label="Train loss")
+    ax1.semilogy(epochs, history["val_losses"],   color="orange", label="Val loss")
+    ax1.axvline(x=best_epoch, color="red", linestyle="--",
+                label=f"Early stop (ep {best_epoch})")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss (log scale)")
+    ax1.set_title(f"Loss Curves — {history['loss_name']}")
+    ax1.legend()
+    ax1.grid(True, which="both", alpha=0.3)
+
+    # ---- Right : LR schedule -----------------------------------------------
+    ax2.plot(epochs, history["lr_history"], color="green", linewidth=1.5)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Learning Rate")
+    ax2.set_title("Learning-Rate Schedule (ReduceLROnPlateau)")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Figure 1 saved → {save_path}")
+
+
+# ===========================================================================
+# Table IV — Ablation study
+# ===========================================================================
+
+def run_ablation(
+    train_loader: DataLoader,
+    val_loader:   DataLoader,
+    test_loader:  DataLoader,
+    n_channels:   int = 3,
+    window_size:  int = 60,
+    max_epochs:   int = 5,
+    device: Optional[torch.device] = None,
+):
+    """Run all 4 loss variants and save Table IV as CSV."""
+    results = []
+
+    for loss_name in LOSS_VARIANTS:
+        log.info(f"\n{'='*60}")
+        log.info(f"ABLATION : {loss_name}")
+        log.info(f"{'='*60}")
+
+        ckpt = OUT_DIR / f"best_model_{loss_name.replace(' ', '_').replace('+','p')}.pt"
+
+        history = train_model(
+            train_loader   = train_loader,
+            val_loader     = val_loader,
+            n_channels     = n_channels,
+            window_size    = window_size,
+            max_epochs     = max_epochs,
+            loss_name      = loss_name,
+            checkpoint_path= ckpt,
+            device         = device,
+        )
+
+        # Plot Figure 1 per variant
+        plot_figure1(
+            history,
+            save_path=OUT_DIR / f"figure1_{loss_name.replace(' ', '_').replace('+','p')}.png"
+        )
+
+        # Evaluate on test set
+        eval_res = evaluate_model(
+            model_path  = ckpt,
+            test_loader = test_loader,
+            n_channels  = n_channels,
+            window_size = window_size,
+            device      = device,
+        )
+
+        row = {
+            "Loss Function":          loss_name,
+            "Val. Loss":              round(history["best_val_loss"], 6),
+            "Test MAE (×10⁻³)":      eval_res["test_mae"],
+            "F1 (%)":                 eval_res["f1"],
+            "Individual Acc. (%)":    eval_res["individual_acc"],
+            "Best Epoch":             history["best_epoch"],
+        }
+        results.append(row)
+        log.info(f"Result : {row}")
+
+    # Save CSV
+    csv_path = OUT_DIR / "table_IV_ablation.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    log.info(f"\nTable IV saved → {csv_path}")
+
+    # Pretty print
+    print("\n" + "=" * 70)
+    print("TABLE IV — Ablation Study : PatternLoss Components Impact")
+    print("=" * 70)
+    header = f"{'Loss Function':<20} {'Val.Loss':>10} {'MAE×10⁻³':>10} {'F1(%)':>8} {'IndAcc(%)':>10}"
+    print(header)
+    print("-" * 70)
+    for r in results:
+        print(
+            f"{r['Loss Function']:<20} "
+            f"{r['Val. Loss']:>10.6f} "
+            f"{r['Test MAE (×10⁻³)']:>10.4f} "
+            f"{r['F1 (%)']:>8.2f} "
+            f"{r['Individual Acc. (%)']:>10.2f}"
+        )
+    print("=" * 70)
+
+    return results
+
+
+# ===========================================================================
+# CLI entry point
+# ===========================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Sprint 3 – TAAE Training")
+    parser.add_argument("--epochs",     type=int,   default=100)
+    parser.add_argument("--batch-size", type=int,   default=256)
+    parser.add_argument("--lr",         type=float, default=0.001)
+    parser.add_argument("--patience",   type=int,   default=5)
+    parser.add_argument("--loss",       type=str,   default="CPLoss Full",
+                        choices=list(LOSS_VARIANTS),
+                        help="Loss variant to use")
+    parser.add_argument("--ablation",   action="store_true",
+                        help="Run all 4 ablation variants (Table IV)")
+    parser.add_argument("--dsn",        type=str,   default=None,
+                        help="TimescaleDB DSN (defaults to .env)")
+    parser.add_argument("--num-workers", type=int,  default=0)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ---- DataLoaders -------------------------------------------------------
+    from thermal_tsdb_dataset import ThermalTSDBDataModule
+
+    dm = ThermalTSDBDataModule(
+        dsn         = args.dsn,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+    )
+    
+    # -- dm._patient_ids = dm._patient_ids[:4]
+    train_loader, val_loader, test_loader = dm.get_loaders()
+
+    n_channels  = 3
+    window_size = 60
+
+    # ---- Run ---------------------------------------------------------------
+    if args.ablation:
+        run_ablation(
+            train_loader = train_loader,
+            val_loader   = val_loader,
+            test_loader  = test_loader,
+            n_channels   = n_channels,
+            window_size  = window_size,
+            max_epochs   = args.epochs,
+            device       = device,
+        )
+    else:
+        history = train_model(
+            train_loader   = train_loader,
+            val_loader     = val_loader,
+            n_channels     = n_channels,
+            window_size    = window_size,
+            max_epochs     = args.epochs,
+            learning_rate  = args.lr,
+            patience       = args.patience,
+            loss_name      = args.loss,
+            device         = device,
+        )
+        plot_figure1(history)
+        log.info("Training complete. Best model saved to sprint3_output/best_model.pt")
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="thermal_tsdb_dataset.py">
+"""
+thermal_tsdb_dataset.py
+
+Sprint 3 – Activity 1 : Database-to-Model Pipeline
+Topic M6 : Synthetic Thermal Time-Series
+Team     : SG03
+
+Objectif
+--------
+Connecter TimescaleDB directement au DataLoader PyTorch.
+Les fenêtres sont lues depuis la base pendant l'entraînement (lecture DB directe),
+sans passer par des fichiers .npy intermédiaires.
+
+Architecture du module
+-----------------------
+  ThermalTSDBDataset     ← torch.utils.data.Dataset
+      • __init__         : connexion TimescaleDB, chargement des métadonnées de fenêtres
+      • __len__          : nombre de fenêtres disponibles
+      • __getitem__      : requête TimescaleDB pour récupérer les signaux d'une fenêtre
+      • _fetch_window    : requête SQL sur thermal_readings (hypertable)
+
+  ThermalTSDBDataModule  ← wrapper haut niveau (inspiré de PyTorch Lightning)
+      • split()          : train / val / test par patient_id
+      • get_loaders()    : retourne les 3 DataLoader configurés
+
+  ConnectionPool         ← pool de connexions psycopg2 pour multi-workers
+      • get_conn()       : retourne une connexion depuis le pool
+
+  benchmark_vs_npy()     ← mesure le temps d'une époque DB vs NPY (sprint 3 T7)
+
+Usage rapide
+------------
+  from thermal_tsdb_dataset import ThermalTSDBDataModule
+
+  dm = ThermalTSDBDataModule(
+      dsn="postgresql://postgres:password@localhost:5432/m6_thermal_tsdb",
+      window_size=60,
+      channels=["left_temperature_norm", "right_temperature_norm", "temp_asymmetry"],
+      batch_size=32,
+      num_workers=4,
+  )
+  train_loader, val_loader, test_loader = dm.get_loaders()
+
+  for batch_signals, batch_labels in train_loader:
+      # batch_signals : (B, C, T) = (32, 3, 60)  float32
+      # batch_labels  : (B,)      int64
+      pass
+
+Variables d'environnement (.env)
+---------------------------------
+  TSDB_HOST     localhost
+  TSDB_PORT     5432
+  TSDB_USER     postgres
+  TSDB_PASSWORD <votre_mot_de_passe>
+  TSDB_DB       m6_thermal_tsdb
+
+Requirements
+------------
+  pip install psycopg2-binary torch numpy pandas python-dotenv tqdm
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import queue
+import threading
+import time
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import psycopg2
+import psycopg2.pool
+import torch
+from torch.utils.data import DataLoader, Dataset
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("thermal_tsdb_dataset")
+
+# ---------------------------------------------------------------------------
+# Constantes (identiques à etl_pipeline.py Sprint 2)
+# ---------------------------------------------------------------------------
+WINDOW_SIZE   = 60        # secondes
+ALL_CHANNELS  = [
+    "left_temperature",
+    "right_temperature",
+    "left_temperature_norm",
+    "right_temperature_norm",
+    "temp_asymmetry",
+]
+DEFAULT_CHANNELS = ["left_temperature_norm", "right_temperature_norm", "temp_asymmetry"]
+
+
+# ---------------------------------------------------------------------------
+# 1. Pool de connexions — nécessaire pour num_workers > 0
+#    Chaque worker PyTorch tourne dans un processus séparé, donc chacun
+#    crée son propre pool local (psycopg2.pool n'est pas fork-safe).
+# ---------------------------------------------------------------------------
+
+class ConnectionPool:
+    """
+    Wrapper autour de psycopg2.ThreadedConnectionPool.
+    Crée un nouveau pool APRÈS le fork PyTorch (dans chaque worker).
+    """
+
+    _local = threading.local()
+
+    def __init__(self, dsn: str, minconn: int = 1, maxconn: int = 4):
+        self._dsn     = dsn
+        self._minconn = minconn
+        self._maxconn = maxconn
+
+    def _get_pool(self) -> psycopg2.pool.ThreadedConnectionPool:
+        """Crée le pool dans le thread courant si pas encore fait."""
+        if not hasattr(self._local, "pool") or self._local.pool is None:
+            self._local.pool = psycopg2.pool.ThreadedConnectionPool(
+                self._minconn,
+                self._maxconn,
+                self._dsn,
+            )
+        return self._local.pool
+
+    def get_conn(self):
+        """Retourne une connexion depuis le pool local."""
+        return self._get_pool().getconn()
+
+    def put_conn(self, conn):
+        """Remet la connexion dans le pool."""
+        if hasattr(self._local, "pool") and self._local.pool:
+            self._local.pool.putconn(conn)
+
+    def close_all(self):
+        """Ferme toutes les connexions du pool local."""
+        if hasattr(self._local, "pool") and self._local.pool:
+            self._local.pool.closeall()
+            self._local.pool = None
+
+
+# ---------------------------------------------------------------------------
+# 2. ThermalTSDBDataset
+# ---------------------------------------------------------------------------
+
+class ThermalTSDBDataset(Dataset):
+    """
+    Dataset PyTorch qui lit les signaux thermiques directement depuis TimescaleDB.
+
+    Paramètres
+    ----------
+    dsn : str
+        DSN PostgreSQL/TimescaleDB.
+    patient_ids : list[int]
+        Liste des patient_id inclus dans ce split.
+    channels : list[str]
+        Colonnes de thermal_readings à récupérer comme canaux du signal.
+        Par défaut : ["left_temperature_norm", "right_temperature_norm", "temp_asymmetry"]
+    window_size : int
+        Nombre de pas de temps par fenêtre (doit correspondre à Sprint 2).
+    anomaly_only : bool
+        Si True, ne charge que les fenêtres anomalies (label=1).
+    cache_metadata : bool
+        Si True, les métadonnées de fenêtres sont mises en cache en mémoire.
+    prefetch_size : int
+        Nombre de fenêtres à pré-charger en arrière-plan (0 = désactivé).
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        patient_ids: List[int],
+        channels: List[str]        = DEFAULT_CHANNELS,
+        window_size: int           = WINDOW_SIZE,
+        anomaly_only: bool         = False,
+        cache_metadata: bool       = True,
+        prefetch_size: int         = 0,
+    ):
+        super().__init__()
+        self.dsn         = dsn
+        self.patient_ids = patient_ids
+        self.channels    = channels
+        self.window_size = window_size
+        self.anomaly_only = anomaly_only
+        self.prefetch_size = prefetch_size
+
+        # Validate channels
+        invalid = set(channels) - set(ALL_CHANNELS)
+        if invalid:
+            raise ValueError(f"Canaux invalides : {invalid}. Valides : {ALL_CHANNELS}")
+
+        # Connexion directe pour charger les métadonnées (hors workers)
+        self._pool = ConnectionPool(dsn)
+
+        # Chargement des métadonnées de fenêtres depuis windows_tsdb
+        self._metadata: pd.DataFrame = self._load_metadata(cache_metadata)
+
+        log.info(
+            f"ThermalTSDBDataset initialisé | "
+            f"patients={patient_ids} | fenêtres={len(self._metadata)} | "
+            f"canaux={channels} | anomaly_only={anomaly_only}"
+        )
+
+        # ----------------------------------------------------------------
+        # Préchargement en RAM : évite N requêtes SQL par époque
+        # Coût unique au démarrage (~30-60s), puis lecture mémoire pure.
+        # ----------------------------------------------------------------
+        log.info(f"Préchargement de {len(self._metadata)} fenêtres en RAM...")
+        self._signal_cache: List[np.ndarray] = []
+        for i in range(len(self._metadata)):
+            row = self._metadata.iloc[i]
+            signal, _ = self._fetch_window(
+                patient_id   = int(row["patient_id"]),
+                window_start = row["window_start"],
+                window_end   = row["window_end"],
+            )
+            self._signal_cache.append(signal)
+            if (i + 1) % 1000 == 0:
+                log.info(f"  Cache : {i + 1}/{len(self._metadata)} fenêtres chargées...")
+        log.info(f"Cache prêt : {len(self._signal_cache)} fenêtres en mémoire.")
+
+        # Labels en numpy array pour accès O(1) sans iloc (beaucoup plus rapide)
+        self._labels: np.ndarray = self._metadata["label"].values.astype(np.int64)
+
+    # ------------------------------------------------------------------
+    # Chargement des métadonnées de fenêtres
+    # ------------------------------------------------------------------
+
+    def _load_metadata(self, cache: bool) -> pd.DataFrame:
+        """
+        Charge la table windows_tsdb pour les patients sélectionnés.
+        Retourne un DataFrame indexé de 0 à N-1 (index = position dans __getitem__).
+        """
+        placeholders = ",".join(["%s"] * len(self.patient_ids))
+        query = f"""
+            SELECT
+                w.patient_id,
+                w.window_id,
+                w.segment_id,
+                w.window_start,
+                w.window_end,
+                w.label,
+                w.anomaly_ratio,
+                w.is_interpolated
+            FROM windows_tsdb w
+            WHERE w.patient_id IN ({placeholders})
+            {"AND w.label = 1" if self.anomaly_only else ""}
+            ORDER BY w.patient_id, w.window_start;
+        """
+        conn = self._pool.get_conn()
+        try:
+            df = pd.read_sql_query(
+                query,
+                conn,
+                params=self.patient_ids,
+                parse_dates=["window_start", "window_end"],
+            )
+        finally:
+            self._pool.put_conn(conn)
+
+        if df.empty:
+            raise RuntimeError(
+                f"Aucune fenêtre trouvée pour les patients {self.patient_ids}. "
+                "Vérifiez que l'ingestion Sprint 2 a bien été exécutée."
+            )
+
+        df = df.reset_index(drop=True)
+        log.info(
+            f"Métadonnées chargées : {len(df)} fenêtres "
+            f"({df['label'].sum()} anomalies / {(df['label']==0).sum()} normales)"
+        )
+        return df
+
+    # ------------------------------------------------------------------
+    # Interface Dataset PyTorch
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._metadata)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Retourne (signal_tensor, label_tensor) pour la fenêtre d'index idx.
+
+        signal_tensor : float32 de forme (C, T) = (len(channels), window_size)
+        label_tensor  : int64   scalaire (0 = normal, 1 = anomalie)
+
+        Lecture depuis le cache RAM (pas de requête SQL ici).
+        """
+        signal = self._signal_cache[idx]          # lecture RAM O(1)
+        label  = int(self._labels[idx])           # numpy array O(1), pas de iloc
+
+        signal_tensor = torch.from_numpy(signal)          # (C, T)
+        label_tensor  = torch.tensor(label, dtype=torch.long)
+        return signal_tensor, label_tensor
+
+    # ------------------------------------------------------------------
+    # Requête TimescaleDB : récupération d'une fenêtre
+    # ------------------------------------------------------------------
+
+    def _fetch_window(
+        self,
+        patient_id: int,
+        window_start: pd.Timestamp,
+        window_end: pd.Timestamp,
+    ) -> Tuple[np.ndarray, List[pd.Timestamp]]:
+        """
+        Requête sur la hypertable thermal_readings.
+
+        Utilise les index idx_tr_patient_ts (patient_id, timestamp DESC)
+        créés en Sprint 2 pour une latence minimale.
+
+        Retourne (signal, timestamps) où signal est (C, T) et timestamps est une liste de T timestamps.
+        """
+        col_select = ", ".join(self.channels)
+        query = f"""
+            SELECT timestamp, {col_select}
+            FROM thermal_readings
+            WHERE patient_id = %s
+              AND timestamp >= %s
+              AND timestamp <= %s
+            ORDER BY timestamp ASC;
+        """
+        conn = self._pool.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (patient_id, window_start, window_end))
+                rows = cur.fetchall()
+        finally:
+            self._pool.put_conn(conn)
+
+        if not rows:
+            # Fenêtre vide : retourne des zéros (cas rare après imputation Sprint 2)
+            log.warning(
+                f"Fenêtre vide pour patient={patient_id} "
+                f"[{window_start} → {window_end}] — zéros retournés"
+            )
+            return (
+                np.zeros((len(self.channels), self.window_size), dtype=np.float32),
+                [window_start + pd.Timedelta(seconds=i) for i in range(self.window_size)]
+            )
+
+        # Extraction des timestamps et du signal
+        timestamps = [r[0] for r in rows]
+        arr = np.array([r[1:] for r in rows], dtype=np.float32)   # (T, C)
+
+        # Ajustement de la longueur à window_size exact
+        T = arr.shape[0]
+        if T < self.window_size:
+            pad = np.zeros((self.window_size - T, len(self.channels)), dtype=np.float32)
+            arr = np.vstack([arr, pad])
+            # Pad timestamps too
+            last_ts = timestamps[-1] if timestamps else window_start
+            for i in range(1, self.window_size - T + 1):
+                timestamps.append(last_ts + pd.Timedelta(seconds=i))
+        elif T > self.window_size:
+            arr = arr[: self.window_size]
+            timestamps = timestamps[: self.window_size]
+
+        return arr.T, timestamps  # (C, T), list[T]
+
+    # ------------------------------------------------------------------
+    # Méthode utilitaire : récupérer une fenêtre avec ses métadonnées
+    # ------------------------------------------------------------------
+
+    def get_sample_with_meta(self, idx: int) -> dict:
+        """Retourne le signal + les métadonnées complètes pour inspection."""
+        row = self._metadata.iloc[idx]
+        signal, timestamps = self._fetch_window(
+            patient_id   = int(row["patient_id"]),
+            window_start = row["window_start"],
+            window_end   = row["window_end"],
+        )
+        label = int(row["label"])
+
+        return {
+            "signal":       torch.from_numpy(signal),
+            "label":        label,
+            "patient_id":   int(row["patient_id"]),
+            "window_id":    int(row["window_id"]),
+            "timestamps":   timestamps,
+            "window_start": row["window_start"],
+            "window_end":   row["window_end"],
+            "anomaly_ratio": row["anomaly_ratio"],
+            "is_interpolated": row["is_interpolated"],
+        }
+
+    # ------------------------------------------------------------------
+    # Stats rapides
+    # ------------------------------------------------------------------
+
+    def class_distribution(self) -> dict:
+        """Retourne la distribution des labels pour ce split."""
+        counts = self._metadata["label"].value_counts().to_dict()
+        total = len(self._metadata)
+        return {
+            "total":    total,
+            "normal":   counts.get(0, 0),
+            "anomaly":  counts.get(1, 0),
+            "anomaly_%": round(100 * counts.get(1, 0) / total, 2),
+        }
+
+    def patients_summary(self) -> pd.DataFrame:
+        """Résumé par patient : nombre de fenêtres normales/anomalies."""
+        return (
+            self._metadata.groupby("patient_id")["label"]
+            .value_counts()
+            .unstack(fill_value=0)
+            .rename(columns={0: "normal", 1: "anomaly"})
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. ThermalTSDBDataModule  (wrapper haut niveau)
+# ---------------------------------------------------------------------------
+
+class ThermalTSDBDataModule:
+    """
+    Gère le split train/val/test et crée les DataLoader correspondants.
+
+    Paramètres
+    ----------
+    dsn : str
+        DSN TimescaleDB. Si None, construit depuis les variables d'env.
+    channels : list[str]
+        Canaux de signal à utiliser.
+    window_size : int
+        Taille de fenêtre en secondes.
+    batch_size : int
+        Taille de lot pour le DataLoader.
+    num_workers : int
+        Nombre de workers PyTorch (0 = main process).
+    train_ratio / val_ratio : float
+        Proportions du split (le reste va au test).
+    seed : int
+        Graine aléatoire pour la reproductibilité.
+    """
+
+    def __init__(
+        self,
+        dsn: Optional[str]     = None,
+        channels: List[str]    = DEFAULT_CHANNELS,
+        window_size: int       = WINDOW_SIZE,
+        batch_size: int        = 32,
+        num_workers: int       = 0,
+        train_ratio: float     = 0.70,
+        val_ratio: float       = 0.15,
+        seed: int              = 42,
+        pin_memory: bool       = True,
+        drop_last: bool        = True,
+    ):
+        self.dsn         = dsn or _build_dsn_from_env()
+        self.channels    = channels
+        self.window_size = window_size
+        self.batch_size  = batch_size
+        self.num_workers = num_workers
+        self.train_ratio = train_ratio
+        self.val_ratio   = val_ratio
+        self.seed        = seed
+        self.pin_memory  = pin_memory and torch.cuda.is_available()
+        self.drop_last   = drop_last
+
+        self._patient_ids: List[int] = self._fetch_all_patient_ids()
+        log.info(f"ThermalTSDBDataModule | {len(self._patient_ids)} patients trouvés")
+
+    def _fetch_all_patient_ids(self) -> List[int]:
+        """Récupère tous les patient_id depuis la table subjects."""
+        conn = psycopg2.connect(self.dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT patient_id FROM subjects ORDER BY patient_id;")
+                return [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def split(self) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Divise les patients en trois ensembles disjoints.
+
+        Stratégie : split par patient_id (pas par fenêtre) pour éviter
+        toute fuite de données entre train et test.
+        """
+        rng     = np.random.default_rng(self.seed)
+        ids     = np.array(self._patient_ids)
+        rng.shuffle(ids)
+
+        n       = len(ids)
+        n_train = max(1, int(n * self.train_ratio))
+        n_val   = max(1, int(n * self.val_ratio))
+
+        train_ids = ids[:n_train].tolist()
+        val_ids   = ids[n_train : n_train + n_val].tolist()
+        test_ids  = ids[n_train + n_val :].tolist()
+
+        log.info(
+            f"Split patients → train={train_ids}, val={val_ids}, test={test_ids}"
+        )
+        return train_ids, val_ids, test_ids
+
+    def get_loaders(
+        self,
+    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """
+        Crée et retourne les trois DataLoader (train, val, test).
+
+        Returns
+        -------
+        train_loader, val_loader, test_loader
+        """
+        train_ids, val_ids, test_ids = self.split()
+
+        train_ds = ThermalTSDBDataset(
+            dsn=self.dsn,
+            patient_ids=train_ids,
+            channels=self.channels,
+            window_size=self.window_size,
+        )
+        val_ds = ThermalTSDBDataset(
+            dsn=self.dsn,
+            patient_ids=val_ids,
+            channels=self.channels,
+            window_size=self.window_size,
+        )
+        test_ds = ThermalTSDBDataset(
+            dsn=self.dsn,
+            patient_ids=test_ids,
+            channels=self.channels,
+            window_size=self.window_size,
+        )
+
+        # Calcul du poids de classe pour gérer le déséquilibre (sprint 2 : ~15 % anomalies)
+        train_weights = _compute_sample_weights(train_ds)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights     = train_weights,
+            num_samples = len(train_weights),
+            replacement = True,
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size  = self.batch_size,
+            sampler     = sampler,           # WeightedRandom pour équilibrer les classes
+            num_workers = self.num_workers,
+            pin_memory  = self.pin_memory,
+            drop_last   = self.drop_last,
+            persistent_workers = self.num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size  = self.batch_size,
+            shuffle     = False,
+            num_workers = self.num_workers,
+            pin_memory  = self.pin_memory,
+            drop_last   = False,
+            persistent_workers = self.num_workers > 0,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size  = self.batch_size,
+            shuffle     = False,
+            num_workers = self.num_workers,
+            pin_memory  = self.pin_memory,
+            drop_last   = False,
+            persistent_workers = self.num_workers > 0,
+        )
+
+        log.info("DataLoaders créés :")
+        log.info(f"  Train : {len(train_ds)} fenêtres | {len(train_loader)} batches")
+        log.info(f"  Val   : {len(val_ds)} fenêtres | {len(val_loader)} batches")
+        log.info(f"  Test  : {len(test_ds)} fenêtres | {len(test_loader)} batches")
+
+        return train_loader, val_loader, test_loader
+
+
+# ---------------------------------------------------------------------------
+# 4. Benchmark DB vs NPY  (pour T7 du Sprint 3)
+# ---------------------------------------------------------------------------
+
+def benchmark_vs_npy(
+    dsn: str,
+    npy_dir: Path,
+    patient_ids: List[int],
+    batch_size: int = 32,
+    num_workers: int = 0,
+    n_epochs: int = 1,
+) -> dict:
+    """
+    Compare la vitesse de lecture depuis TimescaleDB vs fichiers .npy.
+
+    Retourne un dict avec :
+        db_epoch_s  : temps d'une époque complète en lecture DB
+        npy_epoch_s : temps d'une époque complète en lecture NPY
+        speedup     : ratio npy / db (>1 = DB plus lente, <1 = DB plus rapide)
+        db_samples_per_s
+        npy_samples_per_s
+    """
+    from thermal_npy_dataset import ThermalNPYDataset  # voir thermal_npy_dataset.py
+
+    log.info("=" * 60)
+    log.info("BENCHMARK : TimescaleDB vs NPY")
+    log.info("=" * 60)
+
+    # --- DB ---
+    db_ds = ThermalTSDBDataset(
+        dsn=dsn,
+        patient_ids=patient_ids,
+    )
+    db_loader = DataLoader(db_ds, batch_size=batch_size,
+                           num_workers=num_workers, shuffle=True)
+    t0 = time.perf_counter()
+    for _ in range(n_epochs):
+        for _batch in db_loader:
+            pass
+    db_elapsed = time.perf_counter() - t0
+    db_rate = (len(db_ds) * n_epochs) / db_elapsed
+
+    log.info(f"  DB   : {db_elapsed:.2f}s | {db_rate:,.0f} samples/s")
+
+    # --- NPY ---
+    npy_ds = ThermalNPYDataset(npy_dir=npy_dir, patient_ids=patient_ids)
+    npy_loader = DataLoader(npy_ds, batch_size=batch_size,
+                            num_workers=num_workers, shuffle=True)
+    t0 = time.perf_counter()
+    for _ in range(n_epochs):
+        for _batch in npy_loader:
+            pass
+    npy_elapsed = time.perf_counter() - t0
+    npy_rate = (len(npy_ds) * n_epochs) / npy_elapsed
+
+    log.info(f"  NPY  : {npy_elapsed:.2f}s | {npy_rate:,.0f} samples/s")
+    speedup = npy_elapsed / db_elapsed
+    log.info(f"  Speedup (NPY/DB) : {speedup:.2f}x")
+
+    return {
+        "db_epoch_s":       round(db_elapsed, 3),
+        "npy_epoch_s":      round(npy_elapsed, 3),
+        "speedup":          round(speedup, 3),
+        "db_samples_per_s": round(db_rate, 0),
+        "npy_samples_per_s": round(npy_rate, 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Helpers internes
+# ---------------------------------------------------------------------------
+
+def _build_dsn_from_env() -> str:
+    """Construit le DSN depuis les variables d'environnement (.env)."""
+    host     = os.getenv("TSDB_HOST",     "localhost")
+    port     = os.getenv("TSDB_PORT",     "5432")
+    user     = os.getenv("TSDB_USER",     "postgres")
+    password = os.getenv("TSDB_PASSWORD", "postgres")
+    db       = os.getenv("TSDB_DB",       "m6_thermal_tsdb")
+    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
+
+def _compute_sample_weights(dataset: ThermalTSDBDataset) -> torch.Tensor:
+    """
+    Calcule un poids par fenêtre pour le WeightedRandomSampler.
+    Les fenêtres anomalies reçoivent un poids plus élevé pour compenser
+    le déséquilibre de classes (~85 % normal / ~15 % anomalie).
+    """
+    labels = dataset._labels  # numpy array O(1), déjà en mémoire
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / np.where(class_counts > 0, class_counts, 1)
+    sample_weights = class_weights[labels]
+    return torch.from_numpy(sample_weights).float()
+
+
+# ---------------------------------------------------------------------------
+# 6. Script de démonstration / smoke test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Sprint 3 – Test du DataLoader TimescaleDB"
+    )
+    parser.add_argument("--dsn",     default=None,
+                        help="DSN TimescaleDB (défaut : depuis .env)")
+    parser.add_argument("--patients", nargs="+", type=int, default=None,
+                        help="Liste de patient_id à utiliser (défaut : tous)")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--max-batches", type=int, default=5,
+                        help="Nombre maximum de batches à charger dans le test")
+    args = parser.parse_args()
+
+    dsn = args.dsn or _build_dsn_from_env()
+
+    # ----------------------------------------------------------------
+    # Test 1 : chargement direct d'un Dataset
+    # ----------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("TEST 1 : ThermalTSDBDataset")
+    print("=" * 60)
+
+    # Si pas de patients spécifiés, on prend les 3 premiers
+    conn_test = psycopg2.connect(dsn)
+    with conn_test.cursor() as cur:
+        cur.execute("SELECT patient_id FROM subjects ORDER BY patient_id LIMIT 3;")
+        sample_patients = [r[0] for r in cur.fetchall()]
+    conn_test.close()
+
+    patient_ids = args.patients or sample_patients
+    print(f"  Patients : {patient_ids}")
+
+    ds = ThermalTSDBDataset(
+        dsn         = dsn,
+        patient_ids = patient_ids,
+        channels    = DEFAULT_CHANNELS,
+        window_size = WINDOW_SIZE,
+    )
+
+    print(f"  Taille du dataset : {len(ds)} fenêtres")
+    print(f"  Distribution : {ds.class_distribution()}")
+    print(f"  Résumé par patient :\n{ds.patients_summary()}")
+
+    # Chargement d'une fenêtre individuelle
+    t0 = time.perf_counter()
+    signal, label = ds[0]
+    latency_ms = (time.perf_counter() - t0) * 1000
+    print(f"\n  Fenêtre 0 : signal={signal.shape}, label={label.item()}")
+    print(f"  Latence accès fenêtre unique : {latency_ms:.1f} ms")
+
+    # ----------------------------------------------------------------
+    # Test 2 : DataLoader (plusieurs batches)
+    # ----------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("TEST 2 : DataLoader – itération sur batches")
+    print("=" * 60)
+
+    loader = DataLoader(
+        ds,
+        batch_size  = args.batch_size,
+        shuffle     = True,
+        num_workers = args.num_workers,
+    )
+
+    t0 = time.perf_counter()
+    batch_times = []
+    for i, (signals, labels) in enumerate(loader):
+        if i >= args.max_batches:
+            break
+        batch_times.append(time.perf_counter() - t0)
+        print(
+            f"  Batch {i:02d} | signals={tuple(signals.shape)} "
+            f"| labels={labels.tolist()}"
+        )
+        t0 = time.perf_counter()
+
+    print(f"\n  Temps moyen par batch : {np.mean(batch_times)*1000:.1f} ms")
+    print(f"  Débit estimé : {args.batch_size / np.mean(batch_times):.0f} samples/s")
+
+    # ----------------------------------------------------------------
+    # Test 3 : DataModule complet (train/val/test)
+    # ----------------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("TEST 3 : ThermalTSDBDataModule – split train/val/test")
+    print("=" * 60)
+
+    dm = ThermalTSDBDataModule(
+        dsn         = dsn,
+        channels    = DEFAULT_CHANNELS,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+    )
+    train_loader, val_loader, test_loader = dm.get_loaders()
+
+    print(f"\n  Train batches : {len(train_loader)}")
+    print(f"  Val   batches : {len(val_loader)}")
+    print(f"  Test  batches : {len(test_loader)}")
+
+    # Une passe rapide sur le train
+    print("\n  Passe rapide sur train (5 batches)...")
+    t0 = time.perf_counter()
+    for i, (s, l) in enumerate(train_loader):
+        if i >= 5:
+            break
+    elapsed = time.perf_counter() - t0
+    print(f"  5 batches en {elapsed:.2f}s")
+
+    print("\n✓ Tous les tests passés. Le DataLoader TimescaleDB est opérationnel.")
+</file>
+
+</files>
