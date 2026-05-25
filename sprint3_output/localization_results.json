@@ -1,0 +1,106 @@
+{
+  "localization": {
+    "n_anomalous": 89,
+    "n_lateralized": 48,
+    "lateralization_rate": 53.93,
+    "ci_95_low": 43.63,
+    "ci_95_high": 63.91,
+    "n_right_dominant": 27,
+    "n_left_dominant": 21,
+    "n_ambiguous": 41,
+    "mean_error_ratio_right_over_left": 1.495
+  },
+  "asymmetry": {
+    "healthy": {
+      "n_windows": 25828,
+      "mean_right_minus_left_err": 0.000158,
+      "std_right_minus_left_err": 0.039735,
+      "t_statistic": 0.6404,
+      "p_value": 0.521907,
+      "significant_asymmetry": false,
+      "mean_signal_asymmetry": 0.1
+    },
+    "anomalous": {
+      "n_windows": 89,
+      "mean_right_minus_left_err": -0.00709,
+      "std_right_minus_left_err": 2.115672,
+      "t_statistic": -0.0314,
+      "p_value": 0.974992,
+      "significant_asymmetry": false,
+      "mean_signal_asymmetry": 0.129
+    },
+    "healthy_right_fp_rate_pct": 1.0
+  },
+  "quadrants": {
+    "healthy": [
+      {
+        "quadrant": "Q1 (t=0\u201314)",
+        "mean_attention": 0.022298,
+        "std_attention": 0.01229,
+        "mean_recon_err": 0.370158,
+        "std_recon_err": 0.511337
+      },
+      {
+        "quadrant": "Q2 (t=15\u201329)",
+        "mean_attention": 0.009854,
+        "std_attention": 0.006866,
+        "mean_recon_err": 0.370966,
+        "std_recon_err": 0.517286
+      },
+      {
+        "quadrant": "Q3 (t=30\u201344)",
+        "mean_attention": 0.009452,
+        "std_attention": 0.006435,
+        "mean_recon_err": 0.369923,
+        "std_recon_err": 0.511453
+      },
+      {
+        "quadrant": "Q4 (t=45\u201359)",
+        "mean_attention": 0.025063,
+        "std_attention": 0.012293,
+        "mean_recon_err": 0.371469,
+        "std_recon_err": 0.517012
+      }
+    ],
+    "anomalous": [
+      {
+        "quadrant": "Q1 (t=0\u201314)",
+        "mean_attention": 0.02208,
+        "std_attention": 0.011428,
+        "mean_recon_err": 0.883928,
+        "std_recon_err": 1.485765
+      },
+      {
+        "quadrant": "Q2 (t=15\u201329)",
+        "mean_attention": 0.011084,
+        "std_attention": 0.007497,
+        "mean_recon_err": 0.892722,
+        "std_recon_err": 1.32025
+      },
+      {
+        "quadrant": "Q3 (t=30\u201344)",
+        "mean_attention": 0.010973,
+        "std_attention": 0.007203,
+        "mean_recon_err": 0.95084,
+        "std_recon_err": 1.875676
+      },
+      {
+        "quadrant": "Q4 (t=45\u201359)",
+        "mean_attention": 0.02253,
+        "std_attention": 0.010986,
+        "mean_recon_err": 0.849922,
+        "std_recon_err": 1.155607
+      }
+    ],
+    "attention_recon_correlation": {
+      "pearson_r": 0.0982,
+      "p_value": 0.0
+    }
+  },
+  "test_patients": [
+    1,
+    13,
+    8
+  ],
+  "n_windows": 25917
+}

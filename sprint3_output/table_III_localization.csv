@@ -1,0 +1,19 @@
+Metric,Value,CI_95_Low,CI_95_High,Notes
+Anomalous Windows,89,,,Total anomalous windows in test set
+Lateralization Rate (%),53.93,43.63,63.91,Windows with clear left or right dominant error (ratio >1.2)
+Right-dominant errors,27,,,
+Left-dominant errors,21,,,
+Ambiguous errors,41,,,ratio between 0.83 and 1.2
+Mean right/left error ratio (anomalous),1.495,,,>1 = right systematically higher on anomalous windows
+Healthy windows: mean right-left error diff,0.000158,,,"t=0.6404, p=0.521907 — not significant"
+Right channel FP rate on healthy windows (%),1.0,,,% healthy windows where right_err > 1.2 × left_err
+Anomalous windows: mean right-left error diff,-0.00709,,,"t=-0.0314, p=0.974992 — not significant"
+Attention–Reconstruction Pearson r (anomalous),0.0982,,,p=0.0
+Healthy | Q1 (t=0–14) mean attention,0.022298,,,recon_err=0.370158
+Healthy | Q2 (t=15–29) mean attention,0.009854,,,recon_err=0.370966
+Healthy | Q3 (t=30–44) mean attention,0.009452,,,recon_err=0.369923
+Healthy | Q4 (t=45–59) mean attention,0.025063,,,recon_err=0.371469
+Anomalous | Q1 (t=0–14) mean attention,0.02208,,,recon_err=0.883928
+Anomalous | Q2 (t=15–29) mean attention,0.011084,,,recon_err=0.892722
+Anomalous | Q3 (t=30–44) mean attention,0.010973,,,recon_err=0.95084
+Anomalous | Q4 (t=45–59) mean attention,0.02253,,,recon_err=0.849922

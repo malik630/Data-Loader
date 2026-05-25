@@ -1,5 +1,5 @@
 # Sprint 3 — Topic M6 : Synthetic Thermal Time-Series
-**Team SG03 | Sub-team 1 — Model Architecture & Training**
+
 
 ---
 
@@ -30,35 +30,16 @@ sprint3_output/
     ↓
 evaluate.py               ← runs evaluation on test set
     ↓
-    ├── table_I_metrics.csv           ← anomaly detection metrics
-    └── table_II_reconstruction.csv   ← reconstruction quality metrics
+    ├── table_I_metrics.csv                    ← anomaly detection metrics
+    ├── table_II_reconstruction.csv            ← reconstruction quality metrics
+    ├── table_III_localization.csv             ← localization accuracy summary
+    ├── table_III_localization_subjects.csv    ← per-subject localization detail (if truth available)
+    └── figure4.png                            ← attention + reconstruction error visualization
 ```
 
 ---
 
-## Files
 
-### 🆕 Written this Sprint (Team 1)
-
-| File | What it does |
-|---|---|
-| `model.py` | The TAAE model — encoder, attention, decoder. Import this to load the model. |
-| `loss.py` | 4 loss variants: MSE only, MSE+Pattern, MSE+Trend, CPLoss Full. Used during training. |
-| `train.py` | Runs training, saves best checkpoint, generates Figure 1 and Table IV. |
-| `evaluate.py` | Evaluates the trained model on test set. Computes anomaly detection metrics and reconstruction quality. Outputs Table I and Table II. |
-
-### ✅ Built in Previous Tasks (A1 / A2 / A3)
-
-| File | What it does | Task |
-|---|---|---|
-| `thermal_tsdb_dataset.py` | Connects TimescaleDB to PyTorch. Feeds windows to the model during training. | A1 |
-| `thermal_npy_dataset.py` | Same but reads from .npy files. Used only for the speed benchmark. | A1 |
-| `benchmark_A2.py` | Compares DB vs NPY loading speed. Result: NPY is ~110× faster. | A2 |
-| `attention_store.py` | Saves attention weights to DB after inference. | A3 |
-| `extract_attention_a3.py` | Runs the model on test patients and stores attention maps in DB. | A3 |
-| `train_example.py` | Old training script (replaced by train.py — kept for reference). | — |
-
----
 
 ## How to Run
 
@@ -72,8 +53,11 @@ python train.py
 # Run all 4 ablation variants → Table IV
 python train.py --ablation
 
-# Evaluate the trained model → Table I (anomaly metrics) & Table II (reconstruction quality)
+# Evaluate the trained model → Table I (anomaly metrics), Table II (reconstruction quality), Table III (localization)
 python evaluate.py --npy-dir ../Data-Wrangling/etl_output/npy
+
+# Optional: include localization ground truth for Table III detail
+python evaluate.py --npy-dir ../Data-Wrangling/etl_output/npy --localization-truth-csv ../Data-Wrangling/etl_output/localization_truth.csv
 
 # Store attention maps in DB (after training)
 python extract_attention_a3.py
@@ -98,26 +82,12 @@ python extract_attention_a3.py
   - Test healthy windows only
   - Test anomalous windows only
 
----
+**Table III — Localization** (`table_III_localization.csv`, optional `table_III_localization_subjects.csv`)
+- Localization accuracy of left/right anomaly assignment for test subjects
+- 95% confidence interval for localization accuracy
+- Detailed per-subject localization outcomes when ground truth labels are available
 
-## For Other Teams
+**Figure 4 — Attention + Reconstruction Error** (`figure4.png`)
+- Visualizes attention weights and reconstruction error over time for one representative test window
+- Helps interpret where the model attended during the highest-scoring anomaly window
 
-**Team 2 (Evaluation):**
-- Load the model: `from model import TAAE`
-- Load weights: `model.load_state_dict(torch.load("sprint3_output/best_model.pt"))`
-- Anomaly threshold: 85th percentile of healthy training losses
-
-**Team 3 (Explainability):**
-- Attention maps are stored in the `attention_maps` table in TimescaleDB
-- Query high-attention windows per patient using `attention_store.py`
-
----
-
-## Environment (.env)
-```
-TSDB_HOST=localhost
-TSDB_PORT=5433
-TSDB_USER=postgres
-TSDB_PASSWORD=postgres
-TSDB_DB=m6_thermal_tsdb
-```
