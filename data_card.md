@@ -107,7 +107,7 @@ x_celsius = x_norm × σ + μ
 | `recon_error` | FLOAT | Optional per-timestep MSE reconstruction error |
 | `created_at` | TIMESTAMPTZ | Insertion timestamp |
 
-### TimescaleDB (`m6_thermal_tsdb`) — port 5432
+### TimescaleDB (`m6_thermal_tsdb`) — port 5433
 
 | Table | Rows | Type | Description |
 |---|---|---|---|
