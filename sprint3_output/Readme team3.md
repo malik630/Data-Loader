@@ -40,8 +40,8 @@ NPY_DIR=../../Data-Wrangling/data/processed/npy
 
 ```bash
 # 1. Apply schema updates (run once)
-psql -U postgres -d m6_thermal      -f sprint3_output/team3/schema_postgres.sql
-psql -U postgres -d m6_thermal_tsdb -f sprint3_output/team3/schema_timescaledb.sql
+# Configure apply_sprint3_ddl_dumps.bat first (host, port, user, password)
+apply_sprint3_ddl_dumps.bat
 
 # 2. DB Pipeline Benchmark
 python sprint3_output/team3/db_pipeline_benchmark.py
