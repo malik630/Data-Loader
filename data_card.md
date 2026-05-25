@@ -335,9 +335,10 @@ The dataset is immediately publishable and reusable by external researchers. The
 |---|---|---|
 | `schema_postgres.sql` | `sprint3_output/team3/` | DDL PostgreSQL (Sprint 3 update) |
 | `schema_timescaledb.sql` | `sprint3_output/team3/` | DDL TimescaleDB (Sprint 3 update) |
+| `sample_dump_postgres.sql` | `sprint3_output/team3/` | PostgreSQL sample dump for external replication (50 windows, 2 patients) |
+| `sample_dump_timescaledb.sql` | `sprint3_output/team3/` | TimescaleDB sample dump for external replication (50 windows, 2 patients) |
 | `schema_postgres.sql` (Sprint 2) | `dual_db_ingestion/sql/` | Original Sprint 2 DDL |
 | `schema_timescaledb.sql` (Sprint 2) | `dual_db_ingestion/sql/` | Original Sprint 2 DDL |
-| Sample dump (50 windows, 2 patients) | `schema_postgres.sql` Section 3 | Ready for external replication |
 
 ---
 
